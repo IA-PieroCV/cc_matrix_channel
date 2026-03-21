@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get tag
+        id: tag
+        run: echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+
+  build-release:
+    name: Build ${{ matrix.target }}
+    needs: create-release
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            use_cross: false
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            use_cross: true
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            use_cross: false
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            use_cross: false
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            use_cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux' && matrix.use_cross == false
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
+      - name: Install cross
+        if: matrix.use_cross == true
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (cargo)
+        if: matrix.use_cross == false
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.use_cross == true
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          TAG="${{ needs.create-release.outputs.tag }}"
+          ARCHIVE="cc_matrix_channel-${TAG}-${{ matrix.target }}"
+          mkdir -p "${ARCHIVE}"
+          cp "target/${{ matrix.target }}/release/cc_matrix_channel" "${ARCHIVE}/"
+          cp README.md LICENSE "${ARCHIVE}/"
+          tar czf "${ARCHIVE}.tar.gz" "${ARCHIVE}/"
+          shasum -a 256 "${ARCHIVE}.tar.gz" > "${ARCHIVE}.tar.gz.sha256"
+          echo "ARCHIVE=${ARCHIVE}" >> $GITHUB_ENV
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $Tag = "${{ needs.create-release.outputs.tag }}"
+          $Archive = "cc_matrix_channel-${Tag}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $Archive
+          Copy-Item "target\${{ matrix.target }}\release\cc_matrix_channel.exe" "$Archive\"
+          Copy-Item "README.md", "LICENSE" "$Archive\"
+          Compress-Archive -Path "$Archive" -DestinationPath "$Archive.zip"
+          $Hash = (Get-FileHash "$Archive.zip" -Algorithm SHA256).Hash
+          "${Hash}  ${Archive}.zip" | Out-File -Encoding ascii "$Archive.zip.sha256"
+          echo "ARCHIVE=$Archive" >> $env:GITHUB_ENV
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: |
+            cc_matrix_channel-*.tar.gz
+            cc_matrix_channel-*.tar.gz.sha256
+            cc_matrix_channel-*.zip
+            cc_matrix_channel-*.zip.sha256

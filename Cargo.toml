@@ -1,0 +1,35 @@
+[package]
+name = "cc_matrix_channel"
+version = "0.1.0"
+edition = "2024"
+description = "Matrix channel bridge for Claude Code — two-way MCP server"
+license = "MIT"
+repository = "https://github.com/IA-PieroCV/cc_matrix_channel"
+homepage = "https://github.com/IA-PieroCV/cc_matrix_channel"
+keywords = ["matrix", "claude-code", "mcp", "channel", "bridge"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+rmcp = { version = "1", features = ["server", "transport-io", "macros"] }
+matrix-sdk = { version = "0.9", default-features = false, features = ["e2e-encryption", "rustls-tls", "markdown", "sqlite"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.9"
+anyhow = "1"
+schemars = "1"
+mime_guess = "2"
+dirs-next = "2"
+mime = "0.3"
+parking_lot = "0.12"
+constant_time_eq = "0.3"
+libsqlite3-sys = { version = "0.30", features = ["bundled"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"
