@@ -55,7 +55,7 @@ Copy-Item cc_matrix_channel-*\cc_matrix_channel.exe "$env:USERPROFILE\.cargo\bin
 
 ### Build from source
 
-Requires [Rust](https://rustup.rs/) 1.85+ and `libsqlite3-dev`:
+Requires [Rust](https://rustup.rs/) 1.85+:
 
 ```bash
 cargo install --git https://github.com/IA-PieroCV/cc_matrix_channel
