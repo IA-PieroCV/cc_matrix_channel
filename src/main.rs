@@ -11,6 +11,7 @@ use clap::Parser;
 use matrix_sdk::ruma::OwnedRoomId;
 use rmcp::{ServiceExt, transport::stdio};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 use crate::access::AccessControl;
@@ -33,6 +34,30 @@ async fn main() -> Result<()> {
 
     let config = Config::parse();
 
+    // Graceful shutdown coordination
+    let cancel = CancellationToken::new();
+
+    // Signal handler — cancel on SIGTERM/SIGINT
+    let cancel_for_signal = cancel.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
+            let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
+            tokio::select! {
+                _ = sigterm.recv() => tracing::info!("Received SIGTERM"),
+                _ = sigint.recv() => tracing::info!("Received SIGINT"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await.ok();
+            tracing::info!("Received Ctrl-C");
+        }
+        cancel_for_signal.cancel();
+    });
+
     // Shared state
     let access_control = Arc::new(AccessControl::new(
         config.parse_allowed_users(),
@@ -49,6 +74,7 @@ async fn main() -> Result<()> {
         notification_tx,
         access_control.clone(),
         known_rooms.clone(),
+        cancel.clone(),
     )
     .await?;
     let matrix_client = Arc::new(matrix_bridge.client().clone());
@@ -60,6 +86,7 @@ async fn main() -> Result<()> {
         known_rooms,
         notification_rx,
         std::path::PathBuf::from(&config.store_path),
+        cancel.clone(),
     );
 
     tracing::info!("Starting Matrix sync + MCP server");
@@ -67,6 +94,7 @@ async fn main() -> Result<()> {
     tokio::select! {
         result = matrix_bridge.run() => {
             tracing::error!("Matrix sync loop exited: {result:?}");
+            cancel.cancel();
             result?;
         }
         result = async {
@@ -78,9 +106,17 @@ async fn main() -> Result<()> {
             Ok::<(), anyhow::Error>(())
         } => {
             tracing::info!("MCP server exited: {result:?}");
+            cancel.cancel();
             result?;
         }
+        _ = cancel.cancelled() => {
+            tracing::info!("Shutdown signal received");
+        }
     }
+
+    // Brief grace period for in-flight work to complete
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    tracing::info!("cc_matrix_channel shutting down");
 
     Ok(())
 }

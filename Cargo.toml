@@ -26,6 +26,7 @@ dirs-next = "2"
 mime = "0.3"
 parking_lot = "0.12"
 constant_time_eq = "0.3"
+tokio-util = "0.7"
 libsqlite3-sys = { version = "0.30", features = ["bundled"] }
 
 [profile.release]
