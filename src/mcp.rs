@@ -12,6 +12,7 @@ use rmcp::{
 };
 use serde::Deserialize;
 use tokio::sync::{Mutex, mpsc};
+use tokio_util::sync::CancellationToken;
 
 use crate::access::AccessControl;
 use crate::matrix::ChannelNotification;
@@ -101,6 +102,7 @@ pub struct MatrixChannelServer {
     known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
     notification_rx: Arc<Mutex<Option<mpsc::Receiver<ChannelNotification>>>>,
     store_path: std::path::PathBuf,
+    cancel: CancellationToken,
     tool_router: ToolRouter<Self>,
 }
 
@@ -111,6 +113,7 @@ impl MatrixChannelServer {
         known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
         notification_rx: mpsc::Receiver<ChannelNotification>,
         store_path: std::path::PathBuf,
+        cancel: CancellationToken,
     ) -> Self {
         Self {
             matrix_client,
@@ -118,6 +121,7 @@ impl MatrixChannelServer {
             known_rooms,
             notification_rx: Arc::new(Mutex::new(Some(notification_rx))),
             store_path,
+            cancel,
             tool_router: Self::tool_router(),
         }
     }
@@ -754,8 +758,25 @@ impl ServerHandler for MatrixChannelServer {
 
         if let Some(mut rx) = rx {
             let peer = context.peer.clone();
+            let cancel = self.cancel.clone();
             tokio::spawn(async move {
-                while let Some(notif) = rx.recv().await {
+                loop {
+                    let notif = tokio::select! {
+                        notif = rx.recv() => {
+                            match notif {
+                                Some(n) => n,
+                                None => {
+                                    tracing::warn!("Notification channel closed");
+                                    break;
+                                }
+                            }
+                        }
+                        _ = cancel.cancelled() => {
+                            tracing::info!("Notification forwarder shutting down");
+                            break;
+                        }
+                    };
+
                     let mut meta = serde_json::Map::new();
                     meta.insert("sender".into(), notif.sender.into());
                     meta.insert("sender_name".into(), notif.sender_display_name.into());
@@ -789,10 +810,10 @@ impl ServerHandler for MatrixChannelServer {
                         })),
                     ));
                     if let Err(e) = peer.send_notification(custom).await {
-                        tracing::error!("Failed to forward channel notification: {e}");
+                        tracing::error!("Failed to forward notification, MCP peer gone: {e}");
+                        break;
                     }
                 }
-                tracing::warn!("Notification channel closed");
             });
         }
 

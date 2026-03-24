@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use matrix_sdk::{
-    Client, Room,
+    Client, LoopCtrl, Room,
     config::SyncSettings,
     ruma::{
         OwnedDeviceId, OwnedRoomId, OwnedUserId,
@@ -21,6 +21,7 @@ use matrix_sdk::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use crate::access::{AccessControl, AccessDenied};
 use crate::config::Config;
@@ -64,6 +65,7 @@ pub struct MatrixBridge {
     mention_only_rooms: HashSet<OwnedRoomId>,
     ack_emoji: Option<String>,
     start_time: Instant,
+    cancel: CancellationToken,
 }
 
 impl MatrixBridge {
@@ -72,6 +74,7 @@ impl MatrixBridge {
         notification_tx: mpsc::Sender<ChannelNotification>,
         access_control: Arc<AccessControl>,
         known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
+        cancel: CancellationToken,
     ) -> Result<Self> {
         tokio::fs::create_dir_all(&config.store_path).await?;
 
@@ -218,6 +221,7 @@ impl MatrixBridge {
                 Some(config.ack_emoji.clone())
             },
             start_time: Instant::now(),
+            cancel,
         })
     }
 
@@ -276,7 +280,20 @@ impl MatrixBridge {
             });
 
         tracing::info!("Starting Matrix sync loop");
-        self.client.sync(SyncSettings::default()).await?;
+        let cancel = self.cancel.clone();
+        self.client
+            .sync_with_callback(SyncSettings::default(), move |_response| {
+                let cancel = cancel.clone();
+                async move {
+                    if cancel.is_cancelled() {
+                        LoopCtrl::Break
+                    } else {
+                        LoopCtrl::Continue
+                    }
+                }
+            })
+            .await?;
+        tracing::info!("Matrix sync loop stopped");
         Ok(())
     }
 
