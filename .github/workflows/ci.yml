@@ -1,13 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - '*.md'
-      - 'LICENSE'
-      - '.mcp.json.example'
-      - '.github/workflows/release.yml'
   pull_request:
     branches: [main]
     paths-ignore:
