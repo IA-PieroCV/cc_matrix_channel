@@ -1,5 +1,4 @@
-# /matrix:access — Matrix Channel Access Management
-
+---
 name: access
 description: Manage Matrix channel access — approve pairings, edit allowlists, set DM/group policy, and delivery settings. Use when the user asks about access, pairing, who can message, or channel settings.
 user-invocable: true
@@ -8,8 +7,9 @@ allowed-tools:
   - Write
   - Bash(ls *)
   - Bash(mkdir *)
-
 ---
+
+# /matrix:access — Matrix Channel Access Management
 
 This skill manages access control for the Matrix channel by editing `~/.claude/channels/matrix/access.json`. The server re-reads this file on every inbound message — changes take effect immediately without restart.
 
