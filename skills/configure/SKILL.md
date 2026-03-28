@@ -1,5 +1,4 @@
-# /matrix:configure — Matrix Channel Setup
-
+---
 name: configure
 description: Set up the Matrix channel — save credentials, check status, and review configuration. Use when the user pastes Matrix credentials, asks to configure Matrix, asks "how do I set this up," or wants to check channel status.
 user-invocable: true
@@ -10,8 +9,9 @@ allowed-tools:
   - Bash(which *)
   - Bash(ps *)
   - Bash(mkdir *)
-
 ---
+
+# /matrix:configure — Matrix Channel Setup
 
 Manages Matrix channel credentials and guides setup. Connection settings live in `~/.claude/channels/matrix/.env` (KEY=VALUE format). The server reads this file at startup. Access and delivery settings live in `~/.claude/channels/matrix/access.json` (managed by `/matrix:access`).
 
