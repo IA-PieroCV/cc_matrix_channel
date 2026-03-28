@@ -30,16 +30,16 @@ function log(msg: string) {
   process.stderr.write(`[matrix] ${msg}\n`);
 }
 
-function getVersion(): string {
+async function getVersion(): Promise<string> {
   const pluginJsonPath = join(dirname(import.meta.dir), ".claude-plugin", "plugin.json");
   if (existsSync(pluginJsonPath)) {
-    const data = JSON.parse(Bun.file(pluginJsonPath).textSync());
+    const data = JSON.parse(await Bun.file(pluginJsonPath).text());
     return data.version;
   }
   // Fallback: read from Cargo.toml
   const cargoPath = join(dirname(import.meta.dir), "Cargo.toml");
   if (existsSync(cargoPath)) {
-    const text = Bun.file(cargoPath).textSync();
+    const text = await Bun.file(cargoPath).text();
     const match = text.match(/^version\s*=\s*"(.+)"/m);
     if (match) return match[1];
   }
@@ -156,7 +156,7 @@ async function downloadBinary(binaryPath: string, version: string): Promise<void
 
 async function main() {
   const checkOnly = process.argv.includes("--check");
-  const version = getVersion();
+  const version = await getVersion();
   const dataDir = getDataDir();
   const binaryPath = getBinaryPath(dataDir, version);
 
