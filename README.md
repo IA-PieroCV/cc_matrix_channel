@@ -3,7 +3,7 @@
 
 # Matrix Channel for Claude Code
 
-Chat with your running Claude Code session from any Matrix client — phone, desktop, or web.
+Chat with your running Claude Code session from any Matrix client.
 
 Works with any Matrix homeserver (Continuwuity, Synapse, Conduit, Dendrite). Full E2EE support.
 
@@ -11,12 +11,11 @@ Works with any Matrix homeserver (Continuwuity, Synapse, Conduit, Dendrite). Ful
 
 - Two-way messaging with reply threading
 - File attachments (send, receive, auto-decrypt E2EE media)
-- Permission relay — approve/deny tool calls from your phone
+- Permission relay — approve/deny tool calls remotely
 - Runtime config — change settings without restart
 - Pairing-based access control
-- Plugin system — install with one command
 
-## Quick Start
+## Setup (one-time)
 
 Requires [Bun](https://bun.sh).
 
@@ -27,20 +26,18 @@ Requires [Bun](https://bun.sh).
 /matrix:configure https://matrix.example.com @bot:example.com YOUR_PASSWORD
 ```
 
-Restart with the channel enabled:
-
-```bash
-claude --dangerously-load-development-channels plugin:matrix@cc-matrix-channel
-```
-
-Pair your account — DM the bot from Matrix, then:
+Then pair your account — DM the bot from your Matrix client:
 
 ```
 /matrix:access pair <code>
 /matrix:access policy allowlist
 ```
 
-Done. Messages from Matrix now reach Claude.
+## Usage (every session)
+
+```bash
+claude --dangerously-load-development-channels plugin:matrix@cc-matrix-channel
+```
 
 ## Skills
 
