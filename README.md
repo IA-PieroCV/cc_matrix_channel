@@ -23,13 +23,22 @@ Requires [Bun](https://bun.sh).
 /plugin marketplace add IA-PieroCV/cc_matrix_channel
 /plugin install matrix@cc-matrix-channel
 /reload-plugins
+# You must need to restart your session to get the slash commands working and connect to the channel MCP
+# claude --dangerously-load-development-channels plugin:matrix@cc-matrix-channel
+/configure https://matrix.example.com @bot:example.com YOUR_PASSWORD
+OR
 /matrix:configure https://matrix.example.com @bot:example.com YOUR_PASSWORD
 ```
 
 Then pair your account — DM the bot from your Matrix client:
 
 ```
+/access pair <code>
+OR
 /matrix:access pair <code>
+
+/access policy allowlist
+OR
 /matrix:access policy allowlist
 ```
 
