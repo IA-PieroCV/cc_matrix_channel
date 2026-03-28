@@ -352,22 +352,26 @@ dependencies = [
 
 [[package]]
 name = "cc_matrix_channel"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
  "constant_time_eq 0.3.1",
  "dirs-next",
+ "dotenvy",
+ "libc",
  "libsqlite3-sys",
  "matrix-sdk",
  "mime",
  "mime_guess",
  "parking_lot",
  "rand 0.9.2",
+ "regex",
  "rmcp",
  "schemars",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
@@ -750,6 +754,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "dotenvy"
+version = "0.15.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
 name = "dyn-clone"

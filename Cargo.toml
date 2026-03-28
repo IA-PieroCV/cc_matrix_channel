@@ -1,6 +1,6 @@
 [package]
 name = "cc_matrix_channel"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "Matrix channel bridge for Claude Code — two-way MCP server"
 license = "MIT"
@@ -27,7 +27,13 @@ mime = "0.3"
 parking_lot = "0.12"
 constant_time_eq = "0.3"
 tokio-util = "0.7"
+libc = "0.2"
+dotenvy = "0.15"
+regex = "1"
 libsqlite3-sys = { version = "0.30", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 opt-level = "s"

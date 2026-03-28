@@ -7,18 +7,17 @@ use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::*,
-    service::RequestContext,
+    service::{NotificationContext, RequestContext},
     tool, tool_handler, tool_router,
 };
 use serde::Deserialize;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::access::AccessControl;
-use crate::matrix::ChannelNotification;
+use crate::access::{AccessControl, ChunkMode};
+use crate::matrix::{ChannelNotification, PermissionVerdict};
 
 const MAX_TOTAL_LENGTH: usize = 50_000;
-const MAX_CHUNK_SIZE: usize = 4000;
 const MAX_ATTACHMENT_SIZE: u64 = 20 * 1024 * 1024; // 20MB
 const MAX_FILES_PER_REPLY: usize = 10;
 
@@ -100,7 +99,9 @@ pub struct MatrixChannelServer {
     matrix_client: Arc<matrix_sdk::Client>,
     access_control: Arc<AccessControl>,
     known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
+    pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>>,
     notification_rx: Arc<Mutex<Option<mpsc::Receiver<ChannelNotification>>>>,
+    permission_verdict_rx: Arc<Mutex<Option<mpsc::Receiver<PermissionVerdict>>>>,
     store_path: std::path::PathBuf,
     cancel: CancellationToken,
     tool_router: ToolRouter<Self>,
@@ -111,7 +112,9 @@ impl MatrixChannelServer {
         matrix_client: Arc<matrix_sdk::Client>,
         access_control: Arc<AccessControl>,
         known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
+        pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>>,
         notification_rx: mpsc::Receiver<ChannelNotification>,
+        permission_verdict_rx: mpsc::Receiver<PermissionVerdict>,
         store_path: std::path::PathBuf,
         cancel: CancellationToken,
     ) -> Self {
@@ -119,7 +122,9 @@ impl MatrixChannelServer {
             matrix_client,
             access_control,
             known_rooms,
+            pending_permissions,
             notification_rx: Arc::new(Mutex::new(Some(notification_rx))),
+            permission_verdict_rx: Arc::new(Mutex::new(Some(permission_verdict_rx))),
             store_path,
             cancel,
             tool_router: Self::tool_router(),
@@ -177,6 +182,20 @@ impl MatrixChannelServer {
         if !canonical.starts_with(&canonical_cwd) {
             return Err(McpError::invalid_params(
                 "Cannot send files outside the current working directory".to_string(),
+                None,
+            ));
+        }
+
+        // Security: block sensitive file patterns
+        let path_str = canonical.to_string_lossy();
+        if path_str.contains("/.git/")
+            || path_str.ends_with("/.git")
+            || path_str.contains("/.env")
+            || path_str.ends_with(".env")
+            || path_str.contains("/session.json")
+        {
+            return Err(McpError::invalid_params(
+                "Cannot send sensitive files (.git, .env, session.json)".to_string(),
                 None,
             ));
         }
@@ -255,7 +274,9 @@ impl MatrixChannelServer {
             .map(Self::parse_event_id)
             .transpose()?;
 
-        let chunks = chunk_message(&text);
+        let chunk_limit = self.access_control.text_chunk_limit();
+        let chunk_mode = self.access_control.chunk_mode();
+        let chunks = chunk_message(&text, chunk_limit, &chunk_mode);
         let chunk_count = chunks.len();
         let mut event_ids = Vec::new();
 
@@ -307,6 +328,15 @@ impl MatrixChannelServer {
                 event_ids.push(response.event_id.to_string());
                 file_count += 1;
             }
+        }
+
+        // Cancel typing indicator — bypass SDK wrapper which skips the call
+        // if it thinks the 4s timeout already expired (but homeserver may lag)
+        use matrix_sdk::ruma::api::client::typing::create_typing_event::v3::{Request, Typing};
+        if let Some(user_id) = self.matrix_client.user_id() {
+            let typing_request =
+                Request::new(user_id.to_owned(), room.room_id().to_owned(), Typing::No);
+            let _ = self.matrix_client.send(typing_request, None).await;
         }
 
         let ids = event_ids.join(", ");
@@ -458,6 +488,7 @@ impl MatrixChannelServer {
         // Path 1: Fetch by event_id (handles encrypted media transparently)
         let data = if let (Some(evt_id), Some(rm_id)) = (&event_id, &room_id) {
             let room_id = Self::parse_room_id(rm_id)?;
+            self.check_outbound_gate(&room_id)?;
             let event_id = Self::parse_event_id(evt_id)?;
             let room = self.get_room(&room_id)?;
 
@@ -706,6 +737,10 @@ impl ServerHandler for MatrixChannelServer {
 
         let mut exp = std::collections::BTreeMap::new();
         exp.insert("claude/channel".to_string(), serde_json::Map::new());
+        exp.insert(
+            "claude/channel/permission".to_string(),
+            serde_json::Map::new(),
+        );
         capabilities.experimental = Some(exp);
 
         InitializeResult::new(capabilities)
@@ -721,9 +756,9 @@ impl ServerHandler for MatrixChannelServer {
                 "sender=\"@user:server\" sender_name=\"Display Name\" ",
                 "room_id=\"!room:server\" event_id=\"$event\" ts=\"2026-01-01T00:00:00Z\">",
                 "message text</channel>.\n\n",
-                "If the notification includes attachments metadata (mxc_uri), call download_attachment ",
-                "with the mxc_uri (and source_json for encrypted media) to fetch the file, ",
-                "then Read the returned path.\n\n",
+                "If the tag has attachment_count, call download_attachment with the event_id and room_id ",
+                "from the tag to fetch the file (handles encrypted media automatically), then Read the ",
+                "returned path. The attachment_0_mxc_uri attribute is also available as a fallback identifier.\n\n",
                 "Edits don't trigger push notifications — when a long task completes, send a new reply ",
                 "so the user's device pings.\n\n",
                 "Use fetch_messages to pull room history when you need earlier context.\n\n",
@@ -740,7 +775,7 @@ impl ServerHandler for MatrixChannelServer {
                 "Supports reply_to_event_id for threading and optional files for attachments.\n",
                 "- react: Add an emoji reaction to a message (use event_id from channel tag)\n",
                 "- edit_message: Edit a previously sent bot message\n",
-                "- download_attachment: Download a file from Matrix (use event_id + room_id from fetch_messages, or mxc_uri from notification)\n",
+                "- download_attachment: Download a file from Matrix (use event_id + room_id from the channel tag or fetch_messages)\n",
                 "- send_attachment: Send a local file to a Matrix room\n",
                 "- fetch_messages: Get recent message history from a room\n",
                 "- approve_pairing: Approve a user's pairing request (TERMINAL ONLY)\n",
@@ -784,22 +819,28 @@ impl ServerHandler for MatrixChannelServer {
                     meta.insert("event_id".into(), notif.event_id.into());
                     meta.insert("ts".into(), notif.timestamp.into());
 
-                    // Include attachment metadata if present
+                    // Include attachment metadata as flat string keys
+                    // (Claude Code meta values must be strings — non-strings are dropped)
                     if !notif.attachments.is_empty() {
-                        let attachments: Vec<serde_json::Value> = notif
-                            .attachments
-                            .iter()
-                            .map(|a| {
-                                serde_json::json!({
-                                    "name": a.name,
-                                    "mime_type": a.mime_type,
-                                    "size": a.size,
-                                    "mxc_uri": a.mxc_uri,
-                                    "source_json": a.source_json,
-                                })
-                            })
-                            .collect();
-                        meta.insert("attachments".into(), serde_json::Value::Array(attachments));
+                        meta.insert(
+                            "attachment_count".into(),
+                            notif.attachments.len().to_string().into(),
+                        );
+                        for (i, a) in notif.attachments.iter().enumerate() {
+                            meta.insert(format!("attachment_{i}_name").into(), a.name.clone().into());
+                            meta.insert(
+                                format!("attachment_{i}_mime_type").into(),
+                                a.mime_type.clone().into(),
+                            );
+                            meta.insert(
+                                format!("attachment_{i}_size").into(),
+                                a.size.to_string().into(),
+                            );
+                            meta.insert(
+                                format!("attachment_{i}_mxc_uri").into(),
+                                a.mxc_uri.clone().into(),
+                            );
+                        }
                     }
 
                     let custom = ServerNotification::CustomNotification(CustomNotification::new(
@@ -817,14 +858,113 @@ impl ServerHandler for MatrixChannelServer {
             });
         }
 
+        // Verdict forwarder — relays permission verdicts from Matrix back to Claude Code
+        let verdict_rx = self.permission_verdict_rx.lock().await.take();
+        if let Some(mut verdict_rx) = verdict_rx {
+            let peer = context.peer.clone();
+            let cancel = self.cancel.clone();
+            let pending = self.pending_permissions.clone();
+            tokio::spawn(async move {
+                loop {
+                    let verdict = tokio::select! {
+                        v = verdict_rx.recv() => match v {
+                            Some(v) => v,
+                            None => break,
+                        },
+                        _ = cancel.cancelled() => break,
+                    };
+
+                    let notification =
+                        ServerNotification::CustomNotification(CustomNotification::new(
+                            "notifications/claude/channel/permission",
+                            Some(serde_json::json!({
+                                "request_id": verdict.request_id,
+                                "behavior": verdict.behavior,
+                            })),
+                        ));
+                    if let Err(e) = peer.send_notification(notification).await {
+                        tracing::error!("Failed to send permission verdict: {e}");
+                        break;
+                    }
+                    pending.lock().remove(&verdict.request_id);
+                    tracing::info!(
+                        "Permission verdict sent: {} -> {}",
+                        verdict.request_id, verdict.behavior
+                    );
+                }
+            });
+        }
+
         Ok(self.get_info())
+    }
+
+    fn on_custom_notification(
+        &self,
+        notification: CustomNotification,
+        _context: NotificationContext<RoleServer>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        async move {
+            if notification.method != "notifications/claude/channel/permission_request" {
+                return;
+            }
+
+            let params = match notification.params {
+                Some(ref v) => v,
+                None => return,
+            };
+            let request_id = params
+                .get("request_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let tool_name = params
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let description = params
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let input_preview = params
+                .get("input_preview")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            if request_id.is_empty() {
+                tracing::warn!("Permission request missing request_id");
+                return;
+            }
+
+            tracing::info!("Permission request received: {request_id} for {tool_name}");
+            self.pending_permissions
+                .lock()
+                .insert(request_id.to_string());
+
+            let message = format!(
+                "🔐 **Permission request** [`{request_id}`]\n\n\
+                 **Tool:** {tool_name}\n\
+                 **Description:** {description}\n\n\
+                 ```\n{input_preview}\n```\n\n\
+                 Reply `yes {request_id}` to allow or `no {request_id}` to deny."
+            );
+
+            let rooms = self.known_rooms.lock().clone();
+            for room_id in &rooms {
+                if let Some(room) = self.matrix_client.get_room(room_id) {
+                    let content =
+                        matrix_sdk::ruma::events::room::message::RoomMessageEventContent::text_markdown(&message);
+                    if let Err(e) = room.send(content).await {
+                        tracing::error!("Failed to send permission prompt to {room_id}: {e}");
+                    }
+                }
+            }
+        }
     }
 }
 
 // --- Message chunking ---
 
-fn chunk_message(text: &str) -> Vec<&str> {
-    if text.len() <= MAX_CHUNK_SIZE {
+fn chunk_message<'a>(text: &'a str, max_size: usize, mode: &ChunkMode) -> Vec<&'a str> {
+    if text.len() <= max_size {
         return vec![text];
     }
 
@@ -832,24 +972,25 @@ fn chunk_message(text: &str) -> Vec<&str> {
     let mut remaining = text;
 
     while !remaining.is_empty() {
-        if remaining.len() <= MAX_CHUNK_SIZE {
+        if remaining.len() <= max_size {
             chunks.push(remaining);
             break;
         }
 
-        let boundary = &remaining[..MAX_CHUNK_SIZE];
+        let boundary = &remaining[..max_size];
 
-        // Try to split at last newline
-        let split_at = if let Some(pos) = boundary.rfind('\n') {
-            pos + 1
-        }
-        // Try to split at last space
-        else if let Some(pos) = boundary.rfind(' ') {
-            pos + 1
-        }
-        // Hard cut
-        else {
-            MAX_CHUNK_SIZE
+        let split_at = match mode {
+            ChunkMode::Newline => {
+                // Try to split at last newline, then space, then hard cut
+                if let Some(pos) = boundary.rfind('\n') {
+                    pos + 1
+                } else if let Some(pos) = boundary.rfind(' ') {
+                    pos + 1
+                } else {
+                    max_size
+                }
+            }
+            ChunkMode::Length => max_size,
         };
 
         chunks.push(&remaining[..split_at]);
@@ -865,25 +1006,36 @@ mod tests {
 
     #[test]
     fn chunk_short_message() {
-        let chunks = chunk_message("hello");
+        let chunks = chunk_message("hello", 4096, &ChunkMode::Newline);
         assert_eq!(chunks, vec!["hello"]);
     }
 
     #[test]
     fn chunk_long_message_at_newline() {
+        let limit = 4096;
         let mut text = String::new();
         for i in 0..200 {
             text.push_str(&format!(
                 "Line {i:03}: some content here to make this line longer for testing purposes\n"
             ));
         }
-        let chunks = chunk_message(&text);
+        let chunks = chunk_message(&text, limit, &ChunkMode::Newline);
         assert!(chunks.len() > 1);
         for chunk in &chunks {
-            assert!(chunk.len() <= MAX_CHUNK_SIZE);
+            assert!(chunk.len() <= limit);
         }
         // Reassembled text should equal original
         let reassembled: String = chunks.into_iter().collect();
         assert_eq!(reassembled, text);
+    }
+
+    #[test]
+    fn chunk_length_mode_hard_cuts() {
+        let text = "a".repeat(10000);
+        let chunks = chunk_message(&text, 4096, &ChunkMode::Length);
+        assert_eq!(chunks.len(), 3); // 4096 + 4096 + 1808
+        assert_eq!(chunks[0].len(), 4096);
+        assert_eq!(chunks[1].len(), 4096);
+        assert_eq!(chunks[2].len(), 1808);
     }
 }

@@ -1,6 +1,10 @@
 /target/
 /data/
-.mcp.json
 *.swp
 *.swo
 .DS_Store
+.docs/
+node_modules/
+.env
+*.env
+session.json
