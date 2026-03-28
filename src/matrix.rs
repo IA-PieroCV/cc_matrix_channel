@@ -493,25 +493,23 @@ impl MatrixBridge {
                 known_rooms.lock().insert(room.room_id().to_owned());
 
                 // Permission verdict interception — only for pending requests from approved users
-                if let Some(verdict) = parse_permission_verdict(&text) {
-                    if pending_permissions.lock().contains(&verdict.request_id) {
-                        let _ = permission_verdict_tx.send(verdict.clone()).await;
-                        let emoji = if verdict.behavior == "allow" {
-                            "✅"
-                        } else {
-                            "❌"
-                        };
-                        let annotation = matrix_sdk::ruma::events::relation::Annotation::new(
-                            event.event_id.clone(),
-                            emoji.to_string(),
-                        );
-                        let reaction =
-                            matrix_sdk::ruma::events::reaction::ReactionEventContent::new(
-                                annotation,
-                            );
-                        let _ = room.send(reaction).await;
-                        return;
-                    }
+                if let Some(verdict) = parse_permission_verdict(&text)
+                    && pending_permissions.lock().contains(&verdict.request_id)
+                {
+                    let _ = permission_verdict_tx.send(verdict.clone()).await;
+                    let emoji = if verdict.behavior == "allow" {
+                        "✅"
+                    } else {
+                        "❌"
+                    };
+                    let annotation = matrix_sdk::ruma::events::relation::Annotation::new(
+                        event.event_id.clone(),
+                        emoji.to_string(),
+                    );
+                    let reaction =
+                        matrix_sdk::ruma::events::reaction::ReactionEventContent::new(annotation);
+                    let _ = room.send(reaction).await;
+                    return;
                 }
 
                 // Typing indicator — only for text messages (media won't get a Claude response)

@@ -18,7 +18,7 @@ use tracing_subscriber::EnvFilter;
 use crate::access::AccessControl;
 use crate::config::Config;
 use crate::matrix::{ChannelNotification, MatrixBridge, PermissionVerdict};
-use crate::mcp::MatrixChannelServer;
+use crate::mcp::{MatrixChannelServer, McpServerConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -129,16 +129,16 @@ async fn main() -> Result<()> {
     let matrix_client = Arc::new(matrix_bridge.client().clone());
 
     // MCP server
-    let mcp_server = MatrixChannelServer::new(
+    let mcp_server = MatrixChannelServer::new(McpServerConfig {
         matrix_client,
         access_control,
         known_rooms,
         pending_permissions,
         notification_rx,
         permission_verdict_rx,
-        std::path::PathBuf::from(&config.store_path),
-        cancel.clone(),
-    );
+        store_path: std::path::PathBuf::from(&config.store_path),
+        cancel: cancel.clone(),
+    });
 
     tracing::info!("Starting Matrix sync + MCP server");
 

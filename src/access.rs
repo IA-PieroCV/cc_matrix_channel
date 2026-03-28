@@ -12,45 +12,30 @@ const MAX_REPLIES_PER_SENDER: u8 = 2;
 
 // --- Config types (persisted in access.json) ---
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum DmPolicy {
+    #[default]
     Pairing,
     Allowlist,
     Disabled,
 }
 
-impl Default for DmPolicy {
-    fn default() -> Self {
-        Self::Pairing
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum ReplyToMode {
+    #[default]
     First,
     All,
     Off,
 }
 
-impl Default for ReplyToMode {
-    fn default() -> Self {
-        Self::First
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum ChunkMode {
     Length,
+    #[default]
     Newline,
-}
-
-impl Default for ChunkMode {
-    fn default() -> Self {
-        Self::Newline
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -284,10 +269,10 @@ impl AccessControl {
 
         // Check group-specific allowFrom
         let room_str = room_id.as_str();
-        if let Some(group) = config.groups.get(room_str) {
-            if group.allow_from.iter().any(|u| u == "*" || u == user_str) {
-                return Ok(());
-            }
+        if let Some(group) = config.groups.get(room_str)
+            && group.allow_from.iter().any(|u| u == "*" || u == user_str)
+        {
+            return Ok(());
         }
 
         // Allowlist policy with no match → deny (no pairing)
@@ -435,6 +420,7 @@ impl AccessControl {
         self.load_config().chunk_mode
     }
 
+    #[allow(dead_code)] // Public API — will be wired when reply-to mode is implemented
     pub fn reply_to_mode(&self) -> ReplyToMode {
         self.load_config().reply_to_mode
     }

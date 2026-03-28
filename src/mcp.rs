@@ -93,6 +93,18 @@ pub struct FetchMessagesParams {
     pub limit: Option<u32>,
 }
 
+/// Shared state passed to the MCP server at construction.
+pub struct McpServerConfig {
+    pub matrix_client: Arc<matrix_sdk::Client>,
+    pub access_control: Arc<AccessControl>,
+    pub known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
+    pub pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>>,
+    pub notification_rx: mpsc::Receiver<ChannelNotification>,
+    pub permission_verdict_rx: mpsc::Receiver<PermissionVerdict>,
+    pub store_path: std::path::PathBuf,
+    pub cancel: CancellationToken,
+}
+
 /// MCP server that bridges Matrix messages into Claude Code as channel events.
 #[derive(Clone)]
 pub struct MatrixChannelServer {
@@ -108,25 +120,16 @@ pub struct MatrixChannelServer {
 }
 
 impl MatrixChannelServer {
-    pub fn new(
-        matrix_client: Arc<matrix_sdk::Client>,
-        access_control: Arc<AccessControl>,
-        known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
-        pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>>,
-        notification_rx: mpsc::Receiver<ChannelNotification>,
-        permission_verdict_rx: mpsc::Receiver<PermissionVerdict>,
-        store_path: std::path::PathBuf,
-        cancel: CancellationToken,
-    ) -> Self {
+    pub fn new(config: McpServerConfig) -> Self {
         Self {
-            matrix_client,
-            access_control,
-            known_rooms,
-            pending_permissions,
-            notification_rx: Arc::new(Mutex::new(Some(notification_rx))),
-            permission_verdict_rx: Arc::new(Mutex::new(Some(permission_verdict_rx))),
-            store_path,
-            cancel,
+            matrix_client: config.matrix_client,
+            access_control: config.access_control,
+            known_rooms: config.known_rooms,
+            pending_permissions: config.pending_permissions,
+            notification_rx: Arc::new(Mutex::new(Some(config.notification_rx))),
+            permission_verdict_rx: Arc::new(Mutex::new(Some(config.permission_verdict_rx))),
+            store_path: config.store_path,
+            cancel: config.cancel,
             tool_router: Self::tool_router(),
         }
     }
@@ -827,20 +830,14 @@ impl ServerHandler for MatrixChannelServer {
                             notif.attachments.len().to_string().into(),
                         );
                         for (i, a) in notif.attachments.iter().enumerate() {
+                            meta.insert(format!("attachment_{i}_name"), a.name.clone().into());
                             meta.insert(
-                                format!("attachment_{i}_name").into(),
-                                a.name.clone().into(),
-                            );
-                            meta.insert(
-                                format!("attachment_{i}_mime_type").into(),
+                                format!("attachment_{i}_mime_type"),
                                 a.mime_type.clone().into(),
                             );
+                            meta.insert(format!("attachment_{i}_size"), a.size.to_string().into());
                             meta.insert(
-                                format!("attachment_{i}_size").into(),
-                                a.size.to_string().into(),
-                            );
-                            meta.insert(
-                                format!("attachment_{i}_mxc_uri").into(),
+                                format!("attachment_{i}_mxc_uri"),
                                 a.mxc_uri.clone().into(),
                             );
                         }
@@ -902,63 +899,63 @@ impl ServerHandler for MatrixChannelServer {
         Ok(self.get_info())
     }
 
-    fn on_custom_notification(
+    async fn on_custom_notification(
         &self,
         notification: CustomNotification,
         _context: NotificationContext<RoleServer>,
-    ) -> impl std::future::Future<Output = ()> + Send + '_ {
-        async move {
-            if notification.method != "notifications/claude/channel/permission_request" {
-                return;
-            }
+    ) {
+        if notification.method != "notifications/claude/channel/permission_request" {
+            return;
+        }
 
-            let params = match notification.params {
-                Some(ref v) => v,
-                None => return,
-            };
-            let request_id = params
-                .get("request_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let tool_name = params
-                .get("tool_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let description = params
-                .get("description")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let input_preview = params
-                .get("input_preview")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+        let params = match notification.params {
+            Some(ref v) => v,
+            None => return,
+        };
+        let request_id = params
+            .get("request_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let tool_name = params
+            .get("tool_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let description = params
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let input_preview = params
+            .get("input_preview")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
-            if request_id.is_empty() {
-                tracing::warn!("Permission request missing request_id");
-                return;
-            }
+        if request_id.is_empty() {
+            tracing::warn!("Permission request missing request_id");
+            return;
+        }
 
-            tracing::info!("Permission request received: {request_id} for {tool_name}");
-            self.pending_permissions
-                .lock()
-                .insert(request_id.to_string());
+        tracing::info!("Permission request received: {request_id} for {tool_name}");
+        self.pending_permissions
+            .lock()
+            .insert(request_id.to_string());
 
-            let message = format!(
-                "🔐 **Permission request** [`{request_id}`]\n\n\
-                 **Tool:** {tool_name}\n\
-                 **Description:** {description}\n\n\
-                 ```\n{input_preview}\n```\n\n\
-                 Reply `yes {request_id}` to allow or `no {request_id}` to deny."
-            );
+        let message = format!(
+            "🔐 **Permission request** [`{request_id}`]\n\n\
+             **Tool:** {tool_name}\n\
+             **Description:** {description}\n\n\
+             ```\n{input_preview}\n```\n\n\
+             Reply `yes {request_id}` to allow or `no {request_id}` to deny."
+        );
 
-            let rooms = self.known_rooms.lock().clone();
-            for room_id in &rooms {
-                if let Some(room) = self.matrix_client.get_room(room_id) {
-                    let content =
-                        matrix_sdk::ruma::events::room::message::RoomMessageEventContent::text_markdown(&message);
-                    if let Err(e) = room.send(content).await {
-                        tracing::error!("Failed to send permission prompt to {room_id}: {e}");
-                    }
+        let rooms = self.known_rooms.lock().clone();
+        for room_id in &rooms {
+            if let Some(room) = self.matrix_client.get_room(room_id) {
+                let content =
+                    matrix_sdk::ruma::events::room::message::RoomMessageEventContent::text_markdown(
+                        &message,
+                    );
+                if let Err(e) = room.send(content).await {
+                    tracing::error!("Failed to send permission prompt to {room_id}: {e}");
                 }
             }
         }
