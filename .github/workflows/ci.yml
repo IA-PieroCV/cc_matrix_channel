@@ -3,11 +3,6 @@ name: CI
 on:
   pull_request:
     branches: [main]
-    paths:
-      - 'src/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - '.github/workflows/ci.yml'
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,12 +13,35 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if code changed
+        id: changes
+        run: |
+          if git diff --name-only origin/main...HEAD | grep -qE '^(src/|Cargo)'; then
+            echo "code_changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "code_changed=false" >> $GITHUB_OUTPUT
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.changes.outputs.code_changed == 'true'
         with:
           components: rustfmt, clippy
+
       - name: Format check
+        if: steps.changes.outputs.code_changed == 'true'
         run: cargo fmt --check
+
       - name: Clippy
+        if: steps.changes.outputs.code_changed == 'true'
         run: cargo clippy -- -D warnings
+
       - name: Test
+        if: steps.changes.outputs.code_changed == 'true'
         run: cargo test
+
+      - name: No code changes
+        if: steps.changes.outputs.code_changed == 'false'
+        run: echo "No code changes — skipping Rust checks"
