@@ -203,8 +203,7 @@ impl AccessControl {
     }
 
     fn read_config_file(path: &PathBuf) -> Result<AccessConfig, String> {
-        let data =
-            std::fs::read_to_string(path).map_err(|e| format!("read failed: {e}"))?;
+        let data = std::fs::read_to_string(path).map_err(|e| format!("read failed: {e}"))?;
         serde_json::from_str(&data).map_err(|e| format!("parse failed: {e}"))
     }
 
@@ -286,11 +285,7 @@ impl AccessControl {
         // Check group-specific allowFrom
         let room_str = room_id.as_str();
         if let Some(group) = config.groups.get(room_str) {
-            if group
-                .allow_from
-                .iter()
-                .any(|u| u == "*" || u == user_str)
-            {
+            if group.allow_from.iter().any(|u| u == "*" || u == user_str) {
                 return Ok(());
             }
         }
@@ -302,9 +297,7 @@ impl AccessControl {
 
         // Pairing flow
         // Prune expired entries
-        config
-            .pending
-            .retain(|_, entry| entry.expires_at > now);
+        config.pending.retain(|_, entry| entry.expires_at > now);
 
         // Check for existing pending pairing for this sender
         let existing_code = config
@@ -390,8 +383,8 @@ impl AccessControl {
         }
 
         let chat_id = entry.chat_id.clone();
-        let room_id = OwnedRoomId::try_from(chat_id.as_str())
-            .map_err(|_| PairingError::NoPendingPairing)?;
+        let room_id =
+            OwnedRoomId::try_from(chat_id.as_str()).map_err(|_| PairingError::NoPendingPairing)?;
 
         // Move user to allowFrom
         let user_str = user_id.to_string();

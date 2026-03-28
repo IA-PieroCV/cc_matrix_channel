@@ -469,18 +469,16 @@ impl MatrixBridge {
                 if !mentioned {
                     // Check custom mention patterns from config (regex, case-insensitive)
                     let patterns = access.mention_patterns(room.room_id());
-                    let pattern_matched = patterns.iter().any(|pat| {
-                        match regex::RegexBuilder::new(pat)
-                            .case_insensitive(true)
-                            .build()
-                        {
-                            Ok(re) => re.is_match(&text),
-                            Err(e) => {
-                                tracing::warn!("Invalid mention pattern '{pat}': {e}");
-                                false
+                    let pattern_matched =
+                        patterns.iter().any(|pat| {
+                            match regex::RegexBuilder::new(pat).case_insensitive(true).build() {
+                                Ok(re) => re.is_match(&text),
+                                Err(e) => {
+                                    tracing::warn!("Invalid mention pattern '{pat}': {e}");
+                                    false
+                                }
                             }
-                        }
-                    });
+                        });
                     if !pattern_matched {
                         return;
                     }

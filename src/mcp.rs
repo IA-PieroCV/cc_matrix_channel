@@ -827,7 +827,10 @@ impl ServerHandler for MatrixChannelServer {
                             notif.attachments.len().to_string().into(),
                         );
                         for (i, a) in notif.attachments.iter().enumerate() {
-                            meta.insert(format!("attachment_{i}_name").into(), a.name.clone().into());
+                            meta.insert(
+                                format!("attachment_{i}_name").into(),
+                                a.name.clone().into(),
+                            );
                             meta.insert(
                                 format!("attachment_{i}_mime_type").into(),
                                 a.mime_type.clone().into(),
@@ -889,7 +892,8 @@ impl ServerHandler for MatrixChannelServer {
                     pending.lock().remove(&verdict.request_id);
                     tracing::info!(
                         "Permission verdict sent: {} -> {}",
-                        verdict.request_id, verdict.behavior
+                        verdict.request_id,
+                        verdict.behavior
                     );
                 }
             });
