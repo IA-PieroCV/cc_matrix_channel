@@ -3,11 +3,10 @@ name: Release
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - '*.md'
-      - 'LICENSE'
-      - '.mcp.json.example'
-      - '.github/workflows/ci.yml'
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
 
 permissions:
   contents: write

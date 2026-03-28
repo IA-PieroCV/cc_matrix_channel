@@ -109,9 +109,14 @@ impl MatrixBridge {
     ) -> Result<Self> {
         tokio::fs::create_dir_all(&config.store_path).await?;
 
+        let homeserver_url = config
+            .homeserver_url
+            .as_ref()
+            .context("MATRIX_HOMESERVER_URL is required")?;
+
         // Build client with E2EE settings
         let client = Client::builder()
-            .homeserver_url(&config.homeserver_url)
+            .homeserver_url(homeserver_url)
             .sqlite_store(&config.store_path, config.store_passphrase.as_deref())
             .with_encryption_settings(matrix_sdk::encryption::EncryptionSettings {
                 auto_enable_cross_signing: true,
@@ -124,8 +129,12 @@ impl MatrixBridge {
             .context("Failed to build Matrix client")?;
 
         let session_file = session_file_path(&config.store_path);
-        let user_id = OwnedUserId::try_from(config.user_id.as_str())
-            .context(format!("Invalid MATRIX_USER_ID: {}", config.user_id))?;
+        let user_id_str = config
+            .user_id
+            .as_ref()
+            .context("MATRIX_USER_ID is required")?;
+        let user_id = OwnedUserId::try_from(user_id_str.as_str())
+            .context(format!("Invalid MATRIX_USER_ID: {user_id_str}"))?;
 
         // Three login paths: saved session > password login > access token fallback
         if session_file.exists() {
@@ -159,7 +168,9 @@ impl MatrixBridge {
         } else if let Some(ref password) = config.password {
             // Path 2: First-run login with password
             tracing::info!("First-run login for {}", user_id);
-            let localpart = config.user_localpart();
+            let localpart = config
+                .user_localpart()
+                .context("MATRIX_USER_ID is required for login")?;
 
             let mut login_builder = client.matrix_auth().login_username(localpart, password);
 

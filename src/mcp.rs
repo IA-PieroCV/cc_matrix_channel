@@ -1001,6 +1001,30 @@ fn chunk_message<'a>(text: &'a str, max_size: usize, mode: &ChunkMode) -> Vec<&'
     chunks
 }
 
+// --- Setup mode: minimal MCP server for unconfigured state ---
+
+/// Bare MCP server that starts when credentials aren't configured yet.
+/// Keeps the plugin alive so skills register as slash commands.
+#[derive(Clone)]
+pub struct SetupModeServer;
+
+impl ServerHandler for SetupModeServer {
+    fn get_info(&self) -> ServerInfo {
+        let capabilities = ServerCapabilities::builder().build();
+
+        InitializeResult::new(capabilities)
+            .with_server_info(Implementation::new(
+                "matrix-channel",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_protocol_version(ProtocolVersion::V_2024_11_05)
+            .with_instructions(
+                "Matrix channel is not configured yet. \
+                 Run /matrix:configure to set up credentials, then restart Claude Code.",
+            )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
