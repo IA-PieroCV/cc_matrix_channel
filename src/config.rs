@@ -9,7 +9,7 @@ use std::fmt;
 pub struct Config {
     /// Matrix homeserver URL (e.g. https://matrix.example.com)
     #[arg(long, env = "MATRIX_HOMESERVER_URL")]
-    pub homeserver_url: String,
+    pub homeserver_url: Option<String>,
 
     /// Matrix password for initial login — use MATRIX_PASSWORD env var.
     /// Required for first-run E2EE setup. Subsequent runs use saved session.
@@ -21,9 +21,9 @@ pub struct Config {
     #[arg(long, env = "MATRIX_ACCESS_TOKEN", hide = true)]
     pub access_token: Option<String>,
 
-    /// Matrix user ID (e.g. @bot:example.com). Required.
+    /// Matrix user ID (e.g. @bot:example.com)
     #[arg(long, env = "MATRIX_USER_ID")]
-    pub user_id: String,
+    pub user_id: Option<String>,
 
     /// Matrix device ID hint. Auto-generated on first login if omitted.
     #[arg(long, env = "MATRIX_DEVICE_ID")]
@@ -61,9 +61,14 @@ impl fmt::Debug for Config {
 impl Config {
     /// Extract the localpart from the user_id for login_username.
     /// e.g. "@claude:example.com" → "claude"
-    pub fn user_localpart(&self) -> &str {
-        let uid = self.user_id.trim();
+    pub fn user_localpart(&self) -> Option<&str> {
+        let uid = self.user_id.as_deref()?.trim();
         let uid = uid.strip_prefix('@').unwrap_or(uid);
-        uid.split(':').next().unwrap_or(uid)
+        Some(uid.split(':').next().unwrap_or(uid))
+    }
+
+    /// Check if Matrix credentials are configured.
+    pub fn has_credentials(&self) -> bool {
+        self.homeserver_url.is_some() && self.user_id.is_some()
     }
 }

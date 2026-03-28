@@ -18,7 +18,7 @@ use tracing_subscriber::EnvFilter;
 use crate::access::AccessControl;
 use crate::config::Config;
 use crate::matrix::{ChannelNotification, MatrixBridge, PermissionVerdict};
-use crate::mcp::{MatrixChannelServer, McpServerConfig};
+use crate::mcp::{MatrixChannelServer, McpServerConfig, SetupModeServer};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -98,6 +98,24 @@ async fn main() -> Result<()> {
                 }
             }
         });
+    }
+
+    // Setup mode: if credentials aren't configured, start a bare MCP server
+    // so the plugin loads and /matrix:configure skill registers as a slash command.
+    if !config.has_credentials() {
+        tracing::warn!(
+            "Matrix credentials not configured. \
+             Run /matrix:configure to set up, then restart."
+        );
+        let service = SetupModeServer
+            .serve(stdio())
+            .await
+            .map_err(|e| anyhow::anyhow!("MCP setup server failed: {e}"))?;
+        service
+            .waiting()
+            .await
+            .map_err(|e| anyhow::anyhow!("MCP setup server failed: {e}"))?;
+        return Ok(());
     }
 
     // Shared state
