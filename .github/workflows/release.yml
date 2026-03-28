@@ -87,6 +87,12 @@ jobs:
           mkdir -p "${ARCHIVE}"
           cp "target/${{ matrix.target }}/release/cc_matrix_channel" "${ARCHIVE}/"
           cp README.md LICENSE "${ARCHIVE}/"
+          cp -r .claude-plugin "${ARCHIVE}/"
+          cp -r skills "${ARCHIVE}/"
+          cp -r scripts "${ARCHIVE}/"
+          cp package.json "${ARCHIVE}/"
+          cp .mcp.json "${ARCHIVE}/"
+          cp .mcp.json.example "${ARCHIVE}/"
           tar czf "${ARCHIVE}.tar.gz" "${ARCHIVE}/"
           shasum -a 256 "${ARCHIVE}.tar.gz" > "${ARCHIVE}.tar.gz.sha256"
 
@@ -99,6 +105,12 @@ jobs:
           New-Item -ItemType Directory -Path $Archive
           Copy-Item "target\${{ matrix.target }}\release\cc_matrix_channel.exe" "$Archive\"
           Copy-Item "README.md", "LICENSE" "$Archive\"
+          Copy-Item -Recurse ".claude-plugin" "$Archive\"
+          Copy-Item -Recurse "skills" "$Archive\"
+          Copy-Item -Recurse "scripts" "$Archive\"
+          Copy-Item "package.json" "$Archive\"
+          Copy-Item ".mcp.json" "$Archive\"
+          Copy-Item ".mcp.json.example" "$Archive\"
           Compress-Archive -Path "$Archive" -DestinationPath "$Archive.zip"
           $Hash = (Get-FileHash "$Archive.zip" -Algorithm SHA256).Hash
           "${Hash}  ${Archive}.zip" | Out-File -Encoding ascii "$Archive.zip.sha256"

@@ -41,7 +41,36 @@ pub struct AttachmentMeta {
     pub mime_type: String,
     pub size: u64,
     pub mxc_uri: String,
-    pub source_json: String, // serialized MediaSource for encrypted media download
+}
+
+/// A permission verdict from Matrix to be relayed back to Claude Code.
+#[derive(Debug, Clone)]
+pub struct PermissionVerdict {
+    pub request_id: String,
+    pub behavior: String, // "allow" or "deny"
+}
+
+/// Parse a permission verdict from a message like "yes abcde" or "no abcde".
+/// Strips Matrix reply fallback before parsing.
+/// Returns None if the message doesn't match the expected format.
+pub fn parse_permission_verdict(text: &str) -> Option<PermissionVerdict> {
+    use matrix_sdk::ruma::events::room::message::sanitize;
+    let text = sanitize::remove_plain_reply_fallback(text).trim();
+    let (word, rest) = text.split_once(|c: char| c.is_whitespace())?;
+    let behavior = match word.to_lowercase().as_str() {
+        "y" | "yes" => "allow",
+        "n" | "no" => "deny",
+        _ => return None,
+    };
+    let id = rest.trim();
+    // Must be exactly 5 lowercase letters from a-z minus 'l'
+    if id.len() != 5 || !id.chars().all(|c| c.is_ascii_lowercase() && c != 'l') {
+        return None;
+    }
+    Some(PermissionVerdict {
+        request_id: id.to_string(),
+        behavior: behavior.to_string(),
+    })
 }
 
 /// A notification from Matrix to be forwarded to Claude Code via MCP.
@@ -60,10 +89,10 @@ pub struct MatrixBridge {
     client: Client,
     own_user_id: OwnedUserId,
     notification_tx: mpsc::Sender<ChannelNotification>,
+    permission_verdict_tx: mpsc::Sender<PermissionVerdict>,
     access_control: Arc<AccessControl>,
     known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
-    mention_only_rooms: HashSet<OwnedRoomId>,
-    ack_emoji: Option<String>,
+    pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>>,
     start_time: Instant,
     cancel: CancellationToken,
 }
@@ -72,8 +101,10 @@ impl MatrixBridge {
     pub async fn new(
         config: &Config,
         notification_tx: mpsc::Sender<ChannelNotification>,
+        permission_verdict_tx: mpsc::Sender<PermissionVerdict>,
         access_control: Arc<AccessControl>,
         known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
+        pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>>,
         cancel: CancellationToken,
     ) -> Result<Self> {
         tokio::fs::create_dir_all(&config.store_path).await?;
@@ -212,14 +243,10 @@ impl MatrixBridge {
             client,
             own_user_id,
             notification_tx,
+            permission_verdict_tx,
             access_control,
+            pending_permissions,
             known_rooms,
-            mention_only_rooms: config.parse_mention_only_rooms(),
-            ack_emoji: if config.ack_emoji.is_empty() {
-                None
-            } else {
-                Some(config.ack_emoji.clone())
-            },
             start_time: Instant::now(),
             cancel,
         })
@@ -233,11 +260,11 @@ impl MatrixBridge {
         self.client.add_event_handler(Self::handle_invite);
 
         let tx = self.notification_tx.clone();
+        let verdict_tx = self.permission_verdict_tx.clone();
+        let pending_permissions = self.pending_permissions.clone();
         let access = self.access_control.clone();
         let own_user_id = self.own_user_id.clone();
         let known_rooms = self.known_rooms.clone();
-        let mention_only_rooms = self.mention_only_rooms.clone();
-        let ack_emoji = self.ack_emoji.clone();
         let start_time = self.start_time;
 
         // Use Raw<AnySyncTimelineEvent> for manual deserialization — more robust than
@@ -246,11 +273,11 @@ impl MatrixBridge {
         self.client
             .add_event_handler(move |raw: Raw<AnySyncTimelineEvent>, room: Room| {
                 let tx = tx.clone();
+                let verdict_tx = verdict_tx.clone();
+                let pending_permissions = pending_permissions.clone();
                 let access = access.clone();
                 let own_user_id = own_user_id.clone();
                 let known_rooms = known_rooms.clone();
-                let mention_only_rooms = mention_only_rooms.clone();
-                let ack_emoji = ack_emoji.clone();
                 async move {
                     match raw.deserialize() {
                         Ok(AnySyncTimelineEvent::MessageLike(
@@ -261,11 +288,11 @@ impl MatrixBridge {
                                     original.clone(),
                                     room,
                                     tx,
+                                    verdict_tx,
+                                    pending_permissions,
                                     access,
                                     own_user_id,
                                     known_rooms,
-                                    mention_only_rooms,
-                                    ack_emoji,
                                     start_time,
                                 )
                                 .await;
@@ -313,11 +340,11 @@ impl MatrixBridge {
         event: OriginalSyncRoomMessageEvent,
         room: Room,
         tx: mpsc::Sender<ChannelNotification>,
+        permission_verdict_tx: mpsc::Sender<PermissionVerdict>,
+        pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>>,
         access: Arc<AccessControl>,
         own_user_id: OwnedUserId,
         known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
-        mention_only_rooms: HashSet<OwnedRoomId>,
-        ack_emoji: Option<String>,
         start_time: Instant,
     ) {
         if event.sender == own_user_id {
@@ -333,7 +360,11 @@ impl MatrixBridge {
         );
 
         let (text, attachments) = match &event.content.msgtype {
-            MessageType::Text(t) => (t.body.clone(), vec![]),
+            MessageType::Text(t) => {
+                use matrix_sdk::ruma::events::room::message::sanitize;
+                let body = sanitize::remove_plain_reply_fallback(&t.body).to_string();
+                (body, vec![])
+            }
             MessageType::Image(img) => {
                 let meta = AttachmentMeta {
                     name: img.body.clone(),
@@ -350,7 +381,6 @@ impl MatrixBridge {
                         .map(u64::from)
                         .unwrap_or(0),
                     mxc_uri: extract_mxc_uri(&img.source),
-                    source_json: serde_json::to_string(&img.source).unwrap_or_default(),
                 };
                 (format!("[Image: {}]", img.body), vec![meta])
             }
@@ -370,7 +400,6 @@ impl MatrixBridge {
                         .map(u64::from)
                         .unwrap_or(0),
                     mxc_uri: extract_mxc_uri(&file.source),
-                    source_json: serde_json::to_string(&file.source).unwrap_or_default(),
                 };
                 (format!("[File: {}]", file.body), vec![meta])
             }
@@ -390,7 +419,6 @@ impl MatrixBridge {
                         .map(u64::from)
                         .unwrap_or(0),
                     mxc_uri: extract_mxc_uri(&audio.source),
-                    source_json: serde_json::to_string(&audio.source).unwrap_or_default(),
                 };
                 (format!("[Audio: {}]", audio.body), vec![meta])
             }
@@ -410,7 +438,6 @@ impl MatrixBridge {
                         .map(u64::from)
                         .unwrap_or(0),
                     mxc_uri: extract_mxc_uri(&video.source),
-                    source_json: serde_json::to_string(&video.source).unwrap_or_default(),
                 };
                 (format!("[Video: {}]", video.body), vec![meta])
             }
@@ -425,8 +452,8 @@ impl MatrixBridge {
 
         let sender_id = event.sender.clone();
 
-        // Mention-only room check
-        if mention_only_rooms.contains(room.room_id()) {
+        // Mention-only room check (from access.json groups config)
+        if access.requires_mention(room.room_id()) {
             let own_id_str = own_user_id.as_str();
             if !text.contains(own_id_str) {
                 let own_name = room
@@ -440,7 +467,21 @@ impl MatrixBridge {
                     .as_ref()
                     .is_some_and(|name| text.contains(name.as_str()));
                 if !mentioned {
-                    return;
+                    // Check custom mention patterns from config (regex, case-insensitive)
+                    let patterns = access.mention_patterns(room.room_id());
+                    let pattern_matched =
+                        patterns.iter().any(|pat| {
+                            match regex::RegexBuilder::new(pat).case_insensitive(true).build() {
+                                Ok(re) => re.is_match(&text),
+                                Err(e) => {
+                                    tracing::warn!("Invalid mention pattern '{pat}': {e}");
+                                    false
+                                }
+                            }
+                        });
+                    if !pattern_matched {
+                        return;
+                    }
                 }
             }
         }
@@ -450,6 +491,26 @@ impl MatrixBridge {
         match access.check_sender(&sender_id, &current_room_id) {
             Ok(()) => {
                 known_rooms.lock().insert(room.room_id().to_owned());
+
+                // Permission verdict interception — only for pending requests from approved users
+                if let Some(verdict) = parse_permission_verdict(&text)
+                    && pending_permissions.lock().contains(&verdict.request_id)
+                {
+                    let _ = permission_verdict_tx.send(verdict.clone()).await;
+                    let emoji = if verdict.behavior == "allow" {
+                        "✅"
+                    } else {
+                        "❌"
+                    };
+                    let annotation = matrix_sdk::ruma::events::relation::Annotation::new(
+                        event.event_id.clone(),
+                        emoji.to_string(),
+                    );
+                    let reaction =
+                        matrix_sdk::ruma::events::reaction::ReactionEventContent::new(annotation);
+                    let _ = room.send(reaction).await;
+                    return;
+                }
 
                 // Typing indicator — only for text messages (media won't get a Claude response)
                 if attachments.is_empty() {
@@ -481,10 +542,10 @@ impl MatrixBridge {
                 };
                 if tx.send(notif).await.is_ok() {
                     // Ack reaction — confirms message was received
-                    if let Some(ref emoji) = ack_emoji {
+                    if let Some(emoji) = access.ack_reaction() {
                         let annotation = matrix_sdk::ruma::events::relation::Annotation::new(
                             event.event_id.clone(),
-                            emoji.clone(),
+                            emoji,
                         );
                         let reaction =
                             matrix_sdk::ruma::events::reaction::ReactionEventContent::new(

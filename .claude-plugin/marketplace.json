@@ -1,0 +1,15 @@
+{
+  "name": "cc-matrix-channel",
+  "description": "Matrix channel plugin for Claude Code",
+  "owner": {
+    "name": "IA-PieroCV"
+  },
+  "plugins": [
+    {
+      "name": "matrix",
+      "description": "Matrix channel for Claude Code — two-way messaging bridge with E2EE, access control, and permission relay",
+      "source": ".",
+      "version": "0.2.0"
+    }
+  ]
+}
