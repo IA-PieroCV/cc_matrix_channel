@@ -1,9 +1,5 @@
 use clap::Parser;
-use std::collections::HashSet;
 use std::fmt;
-
-use crate::access::AllowPolicy;
-use matrix_sdk::ruma::{OwnedRoomId, OwnedUserId};
 
 #[derive(Parser, Clone)]
 #[command(
@@ -33,11 +29,6 @@ pub struct Config {
     #[arg(long, env = "MATRIX_DEVICE_ID")]
     pub device_id: Option<String>,
 
-    /// Comma-separated list of allowed Matrix user IDs, or "*" for all.
-    /// If not set, all users require pairing approval.
-    #[arg(long, env = "MATRIX_ALLOWED_USERS")]
-    pub allowed_users: Option<String>,
-
     /// Path for SQLite store (E2EE keys + sync state)
     #[arg(long, env = "MATRIX_STORE_PATH", default_value = "./data/matrix_store")]
     pub store_path: String,
@@ -45,18 +36,6 @@ pub struct Config {
     /// Optional passphrase to encrypt the SQLite E2EE store on disk — use MATRIX_STORE_PASSPHRASE env var
     #[arg(long, env = "MATRIX_STORE_PASSPHRASE", hide = true)]
     pub store_passphrase: Option<String>,
-
-    /// Static access mode: disable pairing, only allow configured users
-    #[arg(long, env = "MATRIX_STATIC_ACCESS", default_value = "false")]
-    pub static_access: bool,
-
-    /// Comma-separated room IDs where bot only responds to @-mentions
-    #[arg(long, env = "MATRIX_MENTION_ONLY_ROOMS", default_value = "")]
-    pub mention_only_rooms: String,
-
-    /// Emoji to react with when a message is received (empty string to disable)
-    #[arg(long, env = "MATRIX_ACK_EMOJI", default_value = "\u{1F440}")]
-    pub ack_emoji: String,
 }
 
 impl fmt::Debug for Config {
@@ -70,15 +49,11 @@ impl fmt::Debug for Config {
             )
             .field("user_id", &self.user_id)
             .field("device_id", &self.device_id)
-            .field("allowed_users", &self.allowed_users)
             .field("store_path", &self.store_path)
             .field(
                 "store_passphrase",
                 &self.store_passphrase.as_ref().map(|_| "[REDACTED]"),
             )
-            .field("static_access", &self.static_access)
-            .field("mention_only_rooms", &self.mention_only_rooms)
-            .field("ack_emoji", &self.ack_emoji)
             .finish()
     }
 }
@@ -90,80 +65,5 @@ impl Config {
         let uid = self.user_id.trim();
         let uid = uid.strip_prefix('@').unwrap_or(uid);
         uid.split(':').next().unwrap_or(uid)
-    }
-
-    pub fn parse_allowed_users(&self) -> AllowPolicy {
-        let Some(ref raw) = self.allowed_users else {
-            tracing::info!(
-                "MATRIX_ALLOWED_USERS not set — all users will require pairing approval"
-            );
-            return AllowPolicy::List(HashSet::new());
-        };
-
-        let trimmed = raw.trim();
-        if trimmed == "*" {
-            tracing::warn!(
-                "MATRIX_ALLOWED_USERS is \"*\" — any Matrix user can message Claude Code. \
-                 Set specific user IDs or unset the variable for pairing mode."
-            );
-            return AllowPolicy::All;
-        }
-
-        if trimmed.is_empty() {
-            tracing::info!(
-                "MATRIX_ALLOWED_USERS is empty — all users will require pairing approval"
-            );
-            return AllowPolicy::List(HashSet::new());
-        }
-
-        let mut had_input = false;
-        let users: HashSet<OwnedUserId> = trimmed
-            .split(',')
-            .filter_map(|s| {
-                let s = s.trim();
-                if s.is_empty() {
-                    return None;
-                }
-                had_input = true;
-                match OwnedUserId::try_from(s) {
-                    Ok(uid) => Some(uid),
-                    Err(e) => {
-                        tracing::warn!("Invalid user ID in allowlist '{}': {}", s, e);
-                        None
-                    }
-                }
-            })
-            .collect();
-
-        if users.is_empty() && had_input {
-            tracing::error!(
-                "All user IDs in allowlist were invalid — defaulting to deny-all. \
-                 Fix MATRIX_ALLOWED_USERS or set to \"*\" for allow-all."
-            );
-        }
-        AllowPolicy::List(users)
-    }
-
-    pub fn parse_mention_only_rooms(&self) -> HashSet<OwnedRoomId> {
-        let trimmed = self.mention_only_rooms.trim();
-        if trimmed.is_empty() {
-            return HashSet::new();
-        }
-        trimmed
-            .split(',')
-            .filter_map(|s| {
-                let s = s.trim();
-                if s.is_empty() {
-                    return None;
-                }
-                match OwnedRoomId::try_from(s) {
-                    Ok(rid) => Some(rid),
-                    Err(e) => {
-                        tracing::warn!("Invalid room ID in mention-only list '{}': {}", s, e);
-                        None
-                    }
-                }
-            })
-            .collect()
     }
 }

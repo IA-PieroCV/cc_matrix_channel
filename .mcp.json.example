@@ -1,13 +1,8 @@
 {
   "mcpServers": {
     "matrix": {
-      "command": "cc_matrix_channel",
-      "env": {
-        "MATRIX_HOMESERVER_URL": "https://matrix.example.com",
-        "MATRIX_PASSWORD": "YOUR_BOT_PASSWORD",
-        "MATRIX_USER_ID": "@bot:example.com",
-        "MATRIX_ALLOWED_USERS": "*"
-      }
+      "command": "/path/to/cc_matrix_channel",
+      "env": {}
     }
   }
 }

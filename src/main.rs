@@ -4,6 +4,7 @@ mod matrix;
 mod mcp;
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -16,7 +17,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::access::AccessControl;
 use crate::config::Config;
-use crate::matrix::{ChannelNotification, MatrixBridge};
+use crate::matrix::{ChannelNotification, MatrixBridge, PermissionVerdict};
 use crate::mcp::MatrixChannelServer;
 
 #[tokio::main]
@@ -32,10 +33,29 @@ async fn main() -> Result<()> {
 
     tracing::info!("cc_matrix_channel v{} starting", env!("CARGO_PKG_VERSION"));
 
+    // Load .env file if present (process env vars from .mcp.json take precedence)
+    let env_path = dirs_next::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".claude/channels/matrix/.env");
+    if env_path.exists() {
+        dotenvy::from_path(&env_path).ok();
+        tracing::info!("Loaded .env from {}", env_path.display());
+    }
+
     let config = Config::parse();
 
     // Graceful shutdown coordination
     let cancel = CancellationToken::new();
+
+    // Linux: ask kernel to send SIGTERM when parent process dies.
+    // Our signal handler below catches SIGTERM → cancels the token.
+    #[cfg(target_os = "linux")]
+    {
+        unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) };
+        if unsafe { libc::getppid() } == 1 {
+            anyhow::bail!("Parent process already exited");
+        }
+    }
 
     // Signal handler — cancel on SIGTERM/SIGINT
     let cancel_for_signal = cancel.clone();
@@ -58,22 +78,51 @@ async fn main() -> Result<()> {
         cancel_for_signal.cancel();
     });
 
+    // Unix: poll parent PID to detect orphaning (primary mechanism on macOS,
+    // belt-and-suspenders with prctl on Linux)
+    #[cfg(unix)]
+    {
+        let cancel_for_orphan = cancel.clone();
+        let original_ppid = unsafe { libc::getppid() };
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                let current_ppid = unsafe { libc::getppid() };
+                if current_ppid != original_ppid {
+                    tracing::warn!(
+                        "Parent process died (was {original_ppid}, now {current_ppid}); shutting down"
+                    );
+                    cancel_for_orphan.cancel();
+                    break;
+                }
+            }
+        });
+    }
+
     // Shared state
-    let access_control = Arc::new(AccessControl::new(
-        config.parse_allowed_users(),
-        config.static_access,
-        Some(&config.store_path),
-    ));
+    let config_path = dirs_next::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".claude")
+        .join("channels")
+        .join("matrix")
+        .join("access.json");
+    let access_control = Arc::new(AccessControl::new(config_path));
     let (notification_tx, notification_rx) = mpsc::channel::<ChannelNotification>(256);
+    let (permission_verdict_tx, permission_verdict_rx) = mpsc::channel::<PermissionVerdict>(16);
     let known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>> =
+        Arc::new(parking_lot::Mutex::new(HashSet::new()));
+    let pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>> =
         Arc::new(parking_lot::Mutex::new(HashSet::new()));
 
     // Matrix client
     let matrix_bridge = MatrixBridge::new(
         &config,
         notification_tx,
+        permission_verdict_tx,
         access_control.clone(),
         known_rooms.clone(),
+        pending_permissions.clone(),
         cancel.clone(),
     )
     .await?;
@@ -84,7 +133,9 @@ async fn main() -> Result<()> {
         matrix_client,
         access_control,
         known_rooms,
+        pending_permissions,
         notification_rx,
+        permission_verdict_rx,
         std::path::PathBuf::from(&config.store_path),
         cancel.clone(),
     );

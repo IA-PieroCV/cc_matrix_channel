@@ -1,0 +1,7 @@
+{
+  "name": "cc_matrix_channel",
+  "private": true,
+  "scripts": {
+    "start": "bun scripts/launcher.ts"
+  }
+}
