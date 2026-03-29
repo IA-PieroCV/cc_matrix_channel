@@ -1,7 +1,7 @@
 {
   "name": "matrix",
   "description": "Matrix channel for Claude Code — two-way messaging bridge with E2EE, access control, and permission relay",
-  "version": "0.2.2-rc1",
+  "version": "0.2.2",
   "skills": "./skills/",
   "keywords": ["matrix", "channel", "bridge", "e2ee", "mcp"],
   "repository": "https://github.com/IA-PieroCV/cc_matrix_channel",
