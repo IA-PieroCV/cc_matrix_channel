@@ -79,9 +79,9 @@ pub fn credentials_present(env_path: &Path) -> bool {
     let Ok(content) = std::fs::read_to_string(env_path) else {
         return false;
     };
-    let has_homeserver = content
-        .lines()
-        .any(|l| l.starts_with("MATRIX_HOMESERVER_URL=") && l.len() > "MATRIX_HOMESERVER_URL=".len());
+    let has_homeserver = content.lines().any(|l| {
+        l.starts_with("MATRIX_HOMESERVER_URL=") && l.len() > "MATRIX_HOMESERVER_URL=".len()
+    });
     let has_user_id = content
         .lines()
         .any(|l| l.starts_with("MATRIX_USER_ID=") && l.len() > "MATRIX_USER_ID=".len());

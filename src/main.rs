@@ -135,9 +135,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    let matrix_client = matrix_bridge
-        .as_ref()
-        .map(|b| Arc::new(b.client().clone()));
+    let matrix_client = matrix_bridge.as_ref().map(|b| Arc::new(b.client().clone()));
 
     // MCP server — handles both setup and full mode
     let mcp_server = MatrixChannelServer::new(McpServerConfig {

@@ -874,10 +874,7 @@ impl ServerHandler for MatrixChannelServer {
                                 format!("attachment_{i}_mime_type"),
                                 a.mime_type.clone().into(),
                             );
-                            meta.insert(
-                                format!("attachment_{i}_size"),
-                                a.size.to_string().into(),
-                            );
+                            meta.insert(format!("attachment_{i}_size"), a.size.to_string().into());
                             meta.insert(
                                 format!("attachment_{i}_mxc_uri"),
                                 a.mxc_uri.clone().into(),
@@ -885,14 +882,13 @@ impl ServerHandler for MatrixChannelServer {
                         }
                     }
 
-                    let custom =
-                        ServerNotification::CustomNotification(CustomNotification::new(
-                            "notifications/claude/channel",
-                            Some(serde_json::json!({
-                                "content": notif.content,
-                                "meta": meta,
-                            })),
-                        ));
+                    let custom = ServerNotification::CustomNotification(CustomNotification::new(
+                        "notifications/claude/channel",
+                        Some(serde_json::json!({
+                            "content": notif.content,
+                            "meta": meta,
+                        })),
+                    ));
                     if let Err(e) = peer.send_notification(custom).await {
                         tracing::error!("Failed to forward notification, MCP peer gone: {e}");
                         break;
