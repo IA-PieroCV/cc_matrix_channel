@@ -71,7 +71,7 @@ When 3 arguments are provided (or when the user pastes credentials in any format
    ```
 4. `chmod 600 ~/.claude/channels/matrix/.env` — the file contains credentials
 5. Show the no-args status so the user sees where they stand
-6. Remind: credential changes need a session restart
+6. Tell the user the bot will connect automatically within a few seconds (the server detects the new credentials and restarts itself)
 
 **NEVER write credentials to `.mcp.json`** — it is committed to git and managed by the plugin system. Credentials belong exclusively in `~/.claude/channels/matrix/.env`.
 

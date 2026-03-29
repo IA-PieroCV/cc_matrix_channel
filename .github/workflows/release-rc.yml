@@ -1,0 +1,78 @@
+name: Release RC
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  create-release:
+    name: Create RC Release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=v${VERSION}" >> $GITHUB_OUTPUT
+          echo "Detected version: v${VERSION}"
+      - name: Create GitHub Pre-Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          prerelease: true
+          draft: false
+          generate_release_notes: true
+
+  build-rc:
+    name: Build RC (x86_64-linux)
+    needs: create-release
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Build
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Package
+        run: |
+          VERSION="${{ needs.create-release.outputs.version }}"
+          TARGET="x86_64-unknown-linux-gnu"
+          ARCHIVE="cc_matrix_channel-${VERSION}-${TARGET}"
+          mkdir -p "${ARCHIVE}"
+          cp "target/${TARGET}/release/cc_matrix_channel" "${ARCHIVE}/"
+          cp README.md LICENSE "${ARCHIVE}/"
+          cp -r .claude-plugin "${ARCHIVE}/"
+          cp -r skills "${ARCHIVE}/"
+          cp -r scripts "${ARCHIVE}/"
+          cp package.json "${ARCHIVE}/"
+          cp .mcp.json "${ARCHIVE}/"
+          cp .mcp.json.example "${ARCHIVE}/"
+          tar czf "${ARCHIVE}.tar.gz" "${ARCHIVE}/"
+          shasum -a 256 "${ARCHIVE}.tar.gz" > "${ARCHIVE}.tar.gz.sha256"
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.create-release.outputs.version }}
+          prerelease: true
+          files: |
+            cc_matrix_channel-*.tar.gz
+            cc_matrix_channel-*.tar.gz.sha256

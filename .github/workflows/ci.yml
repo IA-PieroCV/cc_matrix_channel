@@ -2,7 +2,7 @@ name: CI
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main, dev]
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,7 +19,8 @@ jobs:
       - name: Check if code changed
         id: changes
         run: |
-          if git diff --name-only origin/main...HEAD | grep -qE '^(src/|Cargo)'; then
+          BASE="${{ github.base_ref }}"
+          if git diff --name-only "origin/${BASE}...HEAD" | grep -qE '^(src/|Cargo)'; then
             echo "code_changed=true" >> $GITHUB_OUTPUT
           else
             echo "code_changed=false" >> $GITHUB_OUTPUT
