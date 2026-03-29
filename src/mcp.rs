@@ -1,7 +1,6 @@
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId};
 use rmcp::{
@@ -16,7 +15,8 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::access::{AccessControl, ChunkMode};
-use crate::matrix::{ChannelNotification, PermissionVerdict};
+use crate::config::{Config, credentials_present};
+use crate::matrix::{ChannelNotification, MatrixBridge, MatrixBridgeConfig, PermissionVerdict};
 
 const MAX_TOTAL_LENGTH: usize = 50_000;
 const MAX_ATTACHMENT_SIZE: u64 = 20 * 1024 * 1024; // 20MB
@@ -96,46 +96,68 @@ pub struct FetchMessagesParams {
 
 /// Shared state passed to the MCP server at construction.
 pub struct McpServerConfig {
-    pub matrix_client: Arc<matrix_sdk::Client>,
+    pub matrix_client: Option<Arc<matrix_sdk::Client>>,
     pub access_control: Arc<AccessControl>,
     pub known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
     pub pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>>,
+    pub notification_tx: mpsc::Sender<ChannelNotification>,
     pub notification_rx: mpsc::Receiver<ChannelNotification>,
+    pub permission_verdict_tx: mpsc::Sender<PermissionVerdict>,
     pub permission_verdict_rx: mpsc::Receiver<PermissionVerdict>,
-    pub store_path: std::path::PathBuf,
-    pub channel_mode: Arc<AtomicBool>,
+    pub store_path: PathBuf,
+    pub env_path: PathBuf,
     pub cancel: CancellationToken,
 }
 
 /// MCP server that bridges Matrix messages into Claude Code as channel events.
+/// Supports hot-transition from setup mode (no credentials) to full mode.
 #[derive(Clone)]
 pub struct MatrixChannelServer {
-    matrix_client: Arc<matrix_sdk::Client>,
+    matrix_client: Arc<std::sync::OnceLock<Arc<matrix_sdk::Client>>>,
     access_control: Arc<AccessControl>,
     known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
     pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>>,
+    notification_tx: mpsc::Sender<ChannelNotification>,
     notification_rx: Arc<Mutex<Option<mpsc::Receiver<ChannelNotification>>>>,
+    permission_verdict_tx: mpsc::Sender<PermissionVerdict>,
     permission_verdict_rx: Arc<Mutex<Option<mpsc::Receiver<PermissionVerdict>>>>,
-    store_path: std::path::PathBuf,
-    channel_mode: Arc<AtomicBool>,
+    store_path: PathBuf,
+    env_path: PathBuf,
     cancel: CancellationToken,
     tool_router: ToolRouter<Self>,
 }
 
 impl MatrixChannelServer {
     pub fn new(config: McpServerConfig) -> Self {
+        let client_lock = Arc::new(std::sync::OnceLock::new());
+        if let Some(client) = config.matrix_client {
+            let _ = client_lock.set(client);
+        }
         Self {
-            matrix_client: config.matrix_client,
+            matrix_client: client_lock,
             access_control: config.access_control,
             known_rooms: config.known_rooms,
             pending_permissions: config.pending_permissions,
+            notification_tx: config.notification_tx,
             notification_rx: Arc::new(Mutex::new(Some(config.notification_rx))),
+            permission_verdict_tx: config.permission_verdict_tx,
             permission_verdict_rx: Arc::new(Mutex::new(Some(config.permission_verdict_rx))),
             store_path: config.store_path,
-            channel_mode: config.channel_mode,
+            env_path: config.env_path,
             cancel: config.cancel,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Get the Matrix client, returning an error if not yet configured.
+    fn get_client(&self) -> Result<Arc<matrix_sdk::Client>, McpError> {
+        self.matrix_client.get().cloned().ok_or_else(|| {
+            McpError::invalid_request(
+                "Matrix not configured yet. Run /matrix:configure to set up credentials."
+                    .to_string(),
+                None,
+            )
+        })
     }
 
     /// Check that a room is in the known rooms set (outbound gate).
@@ -166,7 +188,8 @@ impl MatrixChannelServer {
     }
 
     fn get_room(&self, room_id: &OwnedRoomId) -> Result<matrix_sdk::Room, McpError> {
-        self.matrix_client.get_room(room_id).ok_or_else(|| {
+        let client = self.get_client()?;
+        client.get_room(room_id).ok_or_else(|| {
             tracing::error!("Room not found: {room_id}");
             McpError::invalid_params("Room not found".to_string(), None)
         })
@@ -340,10 +363,11 @@ impl MatrixChannelServer {
         // Cancel typing indicator — bypass SDK wrapper which skips the call
         // if it thinks the 4s timeout already expired (but homeserver may lag)
         use matrix_sdk::ruma::api::client::typing::create_typing_event::v3::{Request, Typing};
-        if let Some(user_id) = self.matrix_client.user_id() {
+        let client = self.get_client()?;
+        if let Some(user_id) = client.user_id() {
             let typing_request =
                 Request::new(user_id.to_owned(), room.room_id().to_owned(), Typing::No);
-            let _ = self.matrix_client.send(typing_request, None).await;
+            let _ = client.send(typing_request, None).await;
         }
 
         let ids = event_ids.join(", ");
@@ -388,7 +412,8 @@ impl MatrixChannelServer {
             })?;
 
         // Send confirmation to the Matrix room
-        if let Some(room) = self.matrix_client.get_room(&room_id) {
+        let client = self.get_client()?;
+        if let Some(room) = client.get_room(&room_id) {
             let content =
                 matrix_sdk::ruma::events::room::message::RoomMessageEventContent::text_plain(
                     "Paired successfully. Your messages will now be forwarded to Claude Code.",
@@ -531,7 +556,8 @@ impl MatrixChannelServer {
                 source,
                 format: matrix_sdk::media::MediaFormat::File,
             };
-            self.matrix_client
+            let client = self.get_client()?;
+            client
                 .media()
                 .get_media_content(&request, true)
                 .await
@@ -558,7 +584,8 @@ impl MatrixChannelServer {
                 source,
                 format: matrix_sdk::media::MediaFormat::File,
             };
-            self.matrix_client
+            let client = self.get_client()?;
+            client
                 .media()
                 .get_media_content(&request, true)
                 .await
@@ -740,7 +767,10 @@ impl MatrixChannelServer {
 #[tool_handler]
 impl ServerHandler for MatrixChannelServer {
     fn get_info(&self) -> ServerInfo {
-        let mut capabilities = ServerCapabilities::builder().enable_tools().build();
+        let mut capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_tool_list_changed()
+            .build();
 
         let mut exp = std::collections::BTreeMap::new();
         exp.insert("claude/channel".to_string(), serde_json::Map::new());
@@ -750,13 +780,8 @@ impl ServerHandler for MatrixChannelServer {
         );
         capabilities.experimental = Some(exp);
 
-        InitializeResult::new(capabilities)
-            .with_server_info(Implementation::new(
-                "matrix-channel",
-                env!("CARGO_PKG_VERSION"),
-            ))
-            .with_protocol_version(ProtocolVersion::V_2024_11_05)
-            .with_instructions(concat!(
+        let instructions = if self.matrix_client.get().is_some() {
+            concat!(
                 "The sender reads Matrix, not this session. Anything you want them to see ",
                 "must go through the reply tool — your transcript output never reaches their chat.\n\n",
                 "Messages from Matrix arrive as <channel source=\"matrix-channel\" ",
@@ -786,138 +811,140 @@ impl ServerHandler for MatrixChannelServer {
                 "- send_attachment: Send a local file to a Matrix room\n",
                 "- fetch_messages: Get recent message history from a room\n",
                 "- approve_pairing: Approve a user's pairing request (TERMINAL ONLY)\n",
+            )
+        } else {
+            "Matrix channel is not configured yet. \
+             Run /matrix:configure to set up credentials. \
+             Tools will become available automatically after configuration."
+        };
+
+        InitializeResult::new(capabilities)
+            .with_server_info(Implementation::new(
+                "matrix-channel",
+                env!("CARGO_PKG_VERSION"),
             ))
+            .with_protocol_version(ProtocolVersion::V_2024_11_05)
+            .with_instructions(instructions)
     }
 
     async fn initialize(
         &self,
-        request: InitializeRequestParams,
+        _request: InitializeRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, McpError> {
-        let is_channel_session = request
-            .capabilities
-            .experimental
-            .as_ref()
-            .is_some_and(|exp| exp.contains_key("claude/channel"));
+        tracing::info!("MCP client connected");
 
-        if is_channel_session {
-            tracing::info!(
-                "MCP client connected in channel mode — starting notification forwarding"
-            );
-            self.channel_mode.store(true, Ordering::Relaxed);
-        } else {
-            tracing::info!(
-                "MCP client connected without channel capability — running in passive mode \
-                 (messages will not be forwarded)"
-            );
-        }
-
-        if is_channel_session {
-            // Notification forwarder — relays Matrix messages to Claude Code
-            if let Some(mut rx) = self.notification_rx.lock().await.take() {
-                let peer = context.peer.clone();
-                let cancel = self.cancel.clone();
-                tokio::spawn(async move {
-                    loop {
-                        let notif = tokio::select! {
-                            notif = rx.recv() => {
-                                match notif {
-                                    Some(n) => n,
-                                    None => {
-                                        tracing::warn!("Notification channel closed");
-                                        break;
-                                    }
+        // Always spawn notification forwarder — it waits for messages from the bridge
+        if let Some(mut rx) = self.notification_rx.lock().await.take() {
+            let peer = context.peer.clone();
+            let cancel = self.cancel.clone();
+            tokio::spawn(async move {
+                loop {
+                    let notif = tokio::select! {
+                        notif = rx.recv() => {
+                            match notif {
+                                Some(n) => n,
+                                None => {
+                                    tracing::warn!("Notification channel closed");
+                                    break;
                                 }
                             }
-                            _ = cancel.cancelled() => {
-                                tracing::info!("Notification forwarder shutting down");
-                                break;
-                            }
-                        };
-
-                        let mut meta = serde_json::Map::new();
-                        meta.insert("sender".into(), notif.sender.into());
-                        meta.insert("sender_name".into(), notif.sender_display_name.into());
-                        meta.insert("room_id".into(), notif.room_id.into());
-                        meta.insert("event_id".into(), notif.event_id.into());
-                        meta.insert("ts".into(), notif.timestamp.into());
-
-                        // Include attachment metadata as flat string keys
-                        // (Claude Code meta values must be strings — non-strings are dropped)
-                        if !notif.attachments.is_empty() {
-                            meta.insert(
-                                "attachment_count".into(),
-                                notif.attachments.len().to_string().into(),
-                            );
-                            for (i, a) in notif.attachments.iter().enumerate() {
-                                meta.insert(format!("attachment_{i}_name"), a.name.clone().into());
-                                meta.insert(
-                                    format!("attachment_{i}_mime_type"),
-                                    a.mime_type.clone().into(),
-                                );
-                                meta.insert(
-                                    format!("attachment_{i}_size"),
-                                    a.size.to_string().into(),
-                                );
-                                meta.insert(
-                                    format!("attachment_{i}_mxc_uri"),
-                                    a.mxc_uri.clone().into(),
-                                );
-                            }
                         }
-
-                        let custom =
-                            ServerNotification::CustomNotification(CustomNotification::new(
-                                "notifications/claude/channel",
-                                Some(serde_json::json!({
-                                    "content": notif.content,
-                                    "meta": meta,
-                                })),
-                            ));
-                        if let Err(e) = peer.send_notification(custom).await {
-                            tracing::error!("Failed to forward notification, MCP peer gone: {e}");
+                        _ = cancel.cancelled() => {
+                            tracing::info!("Notification forwarder shutting down");
                             break;
                         }
-                    }
-                });
-            }
+                    };
 
-            // Verdict forwarder — relays permission verdicts from Matrix back to Claude Code
-            if let Some(mut verdict_rx) = self.permission_verdict_rx.lock().await.take() {
-                let peer = context.peer.clone();
-                let cancel = self.cancel.clone();
-                let pending = self.pending_permissions.clone();
-                tokio::spawn(async move {
-                    loop {
-                        let verdict = tokio::select! {
-                            v = verdict_rx.recv() => match v {
-                                Some(v) => v,
-                                None => break,
-                            },
-                            _ = cancel.cancelled() => break,
-                        };
+                    let mut meta = serde_json::Map::new();
+                    meta.insert("sender".into(), notif.sender.into());
+                    meta.insert("sender_name".into(), notif.sender_display_name.into());
+                    meta.insert("room_id".into(), notif.room_id.into());
+                    meta.insert("event_id".into(), notif.event_id.into());
+                    meta.insert("ts".into(), notif.timestamp.into());
 
-                        let notification =
-                            ServerNotification::CustomNotification(CustomNotification::new(
-                                "notifications/claude/channel/permission",
-                                Some(serde_json::json!({
-                                    "request_id": verdict.request_id,
-                                    "behavior": verdict.behavior,
-                                })),
-                            ));
-                        if let Err(e) = peer.send_notification(notification).await {
-                            tracing::error!("Failed to send permission verdict: {e}");
-                            break;
-                        }
-                        pending.lock().remove(&verdict.request_id);
-                        tracing::info!(
-                            "Permission verdict sent: {} -> {}",
-                            verdict.request_id,
-                            verdict.behavior
+                    if !notif.attachments.is_empty() {
+                        meta.insert(
+                            "attachment_count".into(),
+                            notif.attachments.len().to_string().into(),
                         );
+                        for (i, a) in notif.attachments.iter().enumerate() {
+                            meta.insert(format!("attachment_{i}_name"), a.name.clone().into());
+                            meta.insert(
+                                format!("attachment_{i}_mime_type"),
+                                a.mime_type.clone().into(),
+                            );
+                            meta.insert(
+                                format!("attachment_{i}_size"),
+                                a.size.to_string().into(),
+                            );
+                            meta.insert(
+                                format!("attachment_{i}_mxc_uri"),
+                                a.mxc_uri.clone().into(),
+                            );
+                        }
                     }
-                });
-            }
+
+                    let custom =
+                        ServerNotification::CustomNotification(CustomNotification::new(
+                            "notifications/claude/channel",
+                            Some(serde_json::json!({
+                                "content": notif.content,
+                                "meta": meta,
+                            })),
+                        ));
+                    if let Err(e) = peer.send_notification(custom).await {
+                        tracing::error!("Failed to forward notification, MCP peer gone: {e}");
+                        break;
+                    }
+                }
+            });
+        }
+
+        // Always spawn verdict forwarder
+        if let Some(mut verdict_rx) = self.permission_verdict_rx.lock().await.take() {
+            let peer = context.peer.clone();
+            let cancel = self.cancel.clone();
+            let pending = self.pending_permissions.clone();
+            tokio::spawn(async move {
+                loop {
+                    let verdict = tokio::select! {
+                        v = verdict_rx.recv() => match v {
+                            Some(v) => v,
+                            None => break,
+                        },
+                        _ = cancel.cancelled() => break,
+                    };
+
+                    let notification =
+                        ServerNotification::CustomNotification(CustomNotification::new(
+                            "notifications/claude/channel/permission",
+                            Some(serde_json::json!({
+                                "request_id": verdict.request_id,
+                                "behavior": verdict.behavior,
+                            })),
+                        ));
+                    if let Err(e) = peer.send_notification(notification).await {
+                        tracing::error!("Failed to send permission verdict: {e}");
+                        break;
+                    }
+                    pending.lock().remove(&verdict.request_id);
+                    tracing::info!(
+                        "Permission verdict sent: {} -> {}",
+                        verdict.request_id,
+                        verdict.behavior
+                    );
+                }
+            });
+        }
+
+        // If no client yet (setup mode), spawn credential watcher for hot-transition
+        if self.matrix_client.get().is_none() {
+            let server = self.clone();
+            let peer = context.peer.clone();
+            tokio::spawn(async move {
+                server.watch_for_credentials(peer).await;
+            });
         }
 
         Ok(self.get_info())
@@ -971,9 +998,13 @@ impl ServerHandler for MatrixChannelServer {
              Reply `yes {request_id}` to allow or `no {request_id}` to deny."
         );
 
+        let client = match self.matrix_client.get() {
+            Some(c) => c.clone(),
+            None => return, // Not configured yet
+        };
         let rooms = self.known_rooms.lock().clone();
         for room_id in &rooms {
-            if let Some(room) = self.matrix_client.get_room(room_id) {
+            if let Some(room) = client.get_room(room_id) {
                 let content =
                     matrix_sdk::ruma::events::room::message::RoomMessageEventContent::text_markdown(
                         &message,
@@ -1025,27 +1056,79 @@ fn chunk_message<'a>(text: &'a str, max_size: usize, mode: &ChunkMode) -> Vec<&'
     chunks
 }
 
-// --- Setup mode: minimal MCP server for unconfigured state ---
+// --- Hot-transition: credential watcher for setup → full mode ---
 
-/// Bare MCP server that starts when credentials aren't configured yet.
-/// Keeps the plugin alive so skills register as slash commands.
-#[derive(Clone)]
-pub struct SetupModeServer;
+impl MatrixChannelServer {
+    /// Polls for credentials and transitions to full mode when they appear.
+    async fn watch_for_credentials(&self, peer: rmcp::service::Peer<RoleServer>) {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = self.cancel.cancelled() => {
+                    tracing::info!("Credential watcher shutting down");
+                    return;
+                }
+            }
 
-impl ServerHandler for SetupModeServer {
-    fn get_info(&self) -> ServerInfo {
-        let capabilities = ServerCapabilities::builder().build();
+            if !credentials_present(&self.env_path) {
+                continue;
+            }
 
-        InitializeResult::new(capabilities)
-            .with_server_info(Implementation::new(
-                "matrix-channel",
-                env!("CARGO_PKG_VERSION"),
-            ))
-            .with_protocol_version(ProtocolVersion::V_2024_11_05)
-            .with_instructions(
-                "Matrix channel is not configured yet. \
-                 Run /matrix:configure to set up credentials, then restart Claude Code.",
-            )
+            tracing::info!("Credentials detected — initializing Matrix bridge");
+
+            match self.transition_to_full_mode().await {
+                Ok(()) => {
+                    tracing::info!("Hot-transition to full mode complete");
+                    if let Err(e) = peer.notify_tool_list_changed().await {
+                        tracing::error!("Failed to notify tools changed: {e}");
+                    }
+                    return;
+                }
+                Err(e) => {
+                    tracing::error!("Failed to transition to full mode: {e}");
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Initialize Matrix bridge and store the client for tool access.
+    async fn transition_to_full_mode(&self) -> anyhow::Result<()> {
+        use clap::Parser;
+
+        // Reload env vars from .env file
+        dotenvy::from_path(&self.env_path).ok();
+        let config = Config::parse();
+
+        let bridge = MatrixBridge::new(
+            &config,
+            MatrixBridgeConfig {
+                notification_tx: self.notification_tx.clone(),
+                permission_verdict_tx: self.permission_verdict_tx.clone(),
+                access_control: self.access_control.clone(),
+                known_rooms: self.known_rooms.clone(),
+                pending_permissions: self.pending_permissions.clone(),
+                cancel: self.cancel.clone(),
+            },
+        )
+        .await?;
+
+        let client = Arc::new(bridge.client().clone());
+        self.matrix_client
+            .set(client)
+            .map_err(|_| anyhow::anyhow!("Client already set"))?;
+
+        // Spawn Matrix sync loop
+        let cancel = self.cancel.clone();
+        tokio::spawn(async move {
+            if let Err(e) = bridge.run().await {
+                tracing::error!("Matrix sync loop failed: {e}");
+                cancel.cancel();
+            }
+        });
+
+        Ok(())
     }
 }
 

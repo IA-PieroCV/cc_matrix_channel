@@ -6,7 +6,6 @@ mod mcp;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use anyhow::Result;
 use clap::Parser;
@@ -19,7 +18,7 @@ use tracing_subscriber::EnvFilter;
 use crate::access::AccessControl;
 use crate::config::Config;
 use crate::matrix::{ChannelNotification, MatrixBridge, MatrixBridgeConfig, PermissionVerdict};
-use crate::mcp::{MatrixChannelServer, McpServerConfig, SetupModeServer};
+use crate::mcp::{MatrixChannelServer, McpServerConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -101,50 +100,6 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Setup mode: if credentials aren't configured, start a bare MCP server
-    // so the plugin loads and /matrix:configure skill registers as a slash command.
-    // A background watcher polls for the .env file — when credentials appear,
-    // the process exits cleanly so Claude Code restarts it with the full server.
-    if !config.has_credentials() {
-        tracing::warn!("Matrix credentials not configured. Run /matrix:configure to set up.");
-
-        let env_path_watch = env_path.clone();
-        let cancel_for_watch = cancel.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                if credentials_present(&env_path_watch) {
-                    tracing::info!(
-                        "Credentials detected in .env — restarting to initialize Matrix bridge"
-                    );
-                    cancel_for_watch.cancel();
-                    break;
-                }
-            }
-        });
-
-        tokio::select! {
-            result = async {
-                let service = SetupModeServer
-                    .serve(stdio())
-                    .await
-                    .map_err(|e| anyhow::anyhow!("MCP setup server failed: {e}"))?;
-                service
-                    .waiting()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("MCP setup server failed: {e}"))?;
-                Ok::<(), anyhow::Error>(())
-            } => {
-                result?;
-            }
-            _ = cancel.cancelled() => {
-                // Credentials appeared or signal received — clean exit triggers auto-restart
-                tracing::info!("Setup mode exiting for restart");
-            }
-        }
-        return Ok(());
-    }
-
     // Shared state
     let config_path = dirs_next::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -159,45 +114,65 @@ async fn main() -> Result<()> {
         Arc::new(parking_lot::Mutex::new(HashSet::new()));
     let pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>> =
         Arc::new(parking_lot::Mutex::new(HashSet::new()));
-    // Starts false — set to true in initialize() when the MCP client declares
-    // the claude/channel capability (i.e. the session was started with --dangerously-load-development-channels).
-    let channel_mode = Arc::new(AtomicBool::new(false));
-    let _ = AtomicOrdering::Relaxed; // suppress unused import warning
 
-    // Matrix client
-    let matrix_bridge = MatrixBridge::new(
-        &config,
-        MatrixBridgeConfig {
-            notification_tx,
-            permission_verdict_tx,
-            access_control: access_control.clone(),
-            known_rooms: known_rooms.clone(),
-            pending_permissions: pending_permissions.clone(),
-            channel_mode: channel_mode.clone(),
-            cancel: cancel.clone(),
-        },
-    )
-    .await?;
-    let matrix_client = Arc::new(matrix_bridge.client().clone());
+    // Initialize Matrix bridge if credentials are available; otherwise setup mode
+    let matrix_bridge = if config.has_credentials() {
+        let bridge = MatrixBridge::new(
+            &config,
+            MatrixBridgeConfig {
+                notification_tx: notification_tx.clone(),
+                permission_verdict_tx: permission_verdict_tx.clone(),
+                access_control: access_control.clone(),
+                known_rooms: known_rooms.clone(),
+                pending_permissions: pending_permissions.clone(),
+                cancel: cancel.clone(),
+            },
+        )
+        .await?;
+        Some(bridge)
+    } else {
+        tracing::warn!("Matrix credentials not configured. Run /matrix:configure to set up.");
+        None
+    };
 
-    // MCP server
+    let matrix_client = matrix_bridge
+        .as_ref()
+        .map(|b| Arc::new(b.client().clone()));
+
+    // MCP server — handles both setup and full mode
     let mcp_server = MatrixChannelServer::new(McpServerConfig {
         matrix_client,
         access_control,
         known_rooms,
         pending_permissions,
+        notification_tx,
         notification_rx,
+        permission_verdict_tx,
         permission_verdict_rx,
-        store_path: std::path::PathBuf::from(&config.store_path),
-        channel_mode,
+        store_path: PathBuf::from(&config.store_path),
+        env_path,
         cancel: cancel.clone(),
     });
 
-    tracing::info!("Starting Matrix sync + MCP server");
+    if matrix_bridge.is_some() {
+        tracing::info!("Starting Matrix sync + MCP server");
+    } else {
+        tracing::info!("Starting MCP server in setup mode (waiting for credentials)");
+    }
 
     tokio::select! {
-        result = matrix_bridge.run() => {
-            tracing::error!("Matrix sync loop exited: {result:?}");
+        result = async {
+            if let Some(bridge) = matrix_bridge {
+                bridge.run().await
+            } else {
+                // No bridge — wait for cancellation (hot-transition handles bridge startup)
+                cancel.cancelled().await;
+                Ok(())
+            }
+        } => {
+            if let Err(ref e) = result {
+                tracing::error!("Matrix sync loop exited: {e:?}");
+            }
             cancel.cancel();
             result?;
         }
@@ -223,22 +198,4 @@ async fn main() -> Result<()> {
     tracing::info!("cc_matrix_channel shutting down");
 
     Ok(())
-}
-
-/// Check whether the .env file contains the minimum required credentials.
-fn credentials_present(env_path: &std::path::Path) -> bool {
-    let Ok(content) = std::fs::read_to_string(env_path) else {
-        return false;
-    };
-    let has_homeserver = content.lines().any(|l| {
-        l.starts_with("MATRIX_HOMESERVER_URL=") && l.len() > "MATRIX_HOMESERVER_URL=".len()
-    });
-    let has_user_id = content
-        .lines()
-        .any(|l| l.starts_with("MATRIX_USER_ID=") && l.len() > "MATRIX_USER_ID=".len());
-    let has_auth = content.lines().any(|l| {
-        (l.starts_with("MATRIX_PASSWORD=") && l.len() > "MATRIX_PASSWORD=".len())
-            || (l.starts_with("MATRIX_ACCESS_TOKEN=") && l.len() > "MATRIX_ACCESS_TOKEN=".len())
-    });
-    has_homeserver && has_user_id && has_auth
 }

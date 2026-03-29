@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -93,7 +92,6 @@ pub struct MatrixBridgeConfig {
     pub access_control: Arc<AccessControl>,
     pub known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
     pub pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>>,
-    pub channel_mode: Arc<AtomicBool>,
     pub cancel: CancellationToken,
 }
 
@@ -106,7 +104,6 @@ struct MessageHandlerCtx {
     access: Arc<AccessControl>,
     own_user_id: OwnedUserId,
     known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
-    channel_mode: Arc<AtomicBool>,
     start_time: Instant,
 }
 
@@ -118,7 +115,6 @@ pub struct MatrixBridge {
     access_control: Arc<AccessControl>,
     known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
     pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>>,
-    channel_mode: Arc<AtomicBool>,
     start_time: Instant,
     cancel: CancellationToken,
 }
@@ -131,7 +127,6 @@ impl MatrixBridge {
             access_control,
             known_rooms,
             pending_permissions,
-            channel_mode,
             cancel,
         } = bridge_config;
         tokio::fs::create_dir_all(&config.store_path).await?;
@@ -285,7 +280,6 @@ impl MatrixBridge {
             access_control,
             pending_permissions,
             known_rooms,
-            channel_mode,
             start_time: Instant::now(),
             cancel,
         })
@@ -305,7 +299,6 @@ impl MatrixBridge {
             access: self.access_control.clone(),
             own_user_id: self.own_user_id.clone(),
             known_rooms: self.known_rooms.clone(),
-            channel_mode: self.channel_mode.clone(),
             start_time: self.start_time,
         };
 
@@ -373,7 +366,6 @@ impl MatrixBridge {
             access,
             own_user_id,
             known_rooms,
-            channel_mode,
             start_time,
         } = ctx;
 
@@ -520,12 +512,6 @@ impl MatrixBridge {
         let current_room_id = room.room_id().to_owned();
         match access.check_sender(&sender_id, &current_room_id) {
             Ok(()) => {
-                // If the MCP client isn't in a channel session, drop silently — no
-                // misleading 👀 ack reaction or typing indicator.
-                if !channel_mode.load(Ordering::Relaxed) {
-                    return;
-                }
-
                 known_rooms.lock().insert(room.room_id().to_owned());
 
                 // Permission verdict interception — only for pending requests from approved users

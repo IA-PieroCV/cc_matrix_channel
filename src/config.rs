@@ -1,5 +1,6 @@
 use clap::Parser;
 use std::fmt;
+use std::path::Path;
 
 #[derive(Parser, Clone)]
 #[command(
@@ -71,4 +72,22 @@ impl Config {
     pub fn has_credentials(&self) -> bool {
         self.homeserver_url.is_some() && self.user_id.is_some()
     }
+}
+
+/// Check whether the .env file contains the minimum required credentials.
+pub fn credentials_present(env_path: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(env_path) else {
+        return false;
+    };
+    let has_homeserver = content
+        .lines()
+        .any(|l| l.starts_with("MATRIX_HOMESERVER_URL=") && l.len() > "MATRIX_HOMESERVER_URL=".len());
+    let has_user_id = content
+        .lines()
+        .any(|l| l.starts_with("MATRIX_USER_ID=") && l.len() > "MATRIX_USER_ID=".len());
+    let has_auth = content.lines().any(|l| {
+        (l.starts_with("MATRIX_PASSWORD=") && l.len() > "MATRIX_PASSWORD=".len())
+            || (l.starts_with("MATRIX_ACCESS_TOKEN=") && l.len() > "MATRIX_ACCESS_TOKEN=".len())
+    });
+    has_homeserver && has_user_id && has_auth
 }
