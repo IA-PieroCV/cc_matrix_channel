@@ -17,8 +17,8 @@ use tracing_subscriber::EnvFilter;
 
 use crate::access::AccessControl;
 use crate::config::Config;
-use crate::matrix::{ChannelNotification, MatrixBridge, PermissionVerdict};
-use crate::mcp::{MatrixChannelServer, McpServerConfig, SetupModeServer};
+use crate::matrix::{ChannelNotification, MatrixBridge, MatrixBridgeConfig, PermissionVerdict};
+use crate::mcp::{MatrixChannelServer, McpServerConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -100,24 +100,6 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Setup mode: if credentials aren't configured, start a bare MCP server
-    // so the plugin loads and /matrix:configure skill registers as a slash command.
-    if !config.has_credentials() {
-        tracing::warn!(
-            "Matrix credentials not configured. \
-             Run /matrix:configure to set up, then restart."
-        );
-        let service = SetupModeServer
-            .serve(stdio())
-            .await
-            .map_err(|e| anyhow::anyhow!("MCP setup server failed: {e}"))?;
-        service
-            .waiting()
-            .await
-            .map_err(|e| anyhow::anyhow!("MCP setup server failed: {e}"))?;
-        return Ok(());
-    }
-
     // Shared state
     let config_path = dirs_next::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -133,36 +115,62 @@ async fn main() -> Result<()> {
     let pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>> =
         Arc::new(parking_lot::Mutex::new(HashSet::new()));
 
-    // Matrix client
-    let matrix_bridge = MatrixBridge::new(
-        &config,
-        notification_tx,
-        permission_verdict_tx,
-        access_control.clone(),
-        known_rooms.clone(),
-        pending_permissions.clone(),
-        cancel.clone(),
-    )
-    .await?;
-    let matrix_client = Arc::new(matrix_bridge.client().clone());
+    // Initialize Matrix bridge if credentials are available; otherwise setup mode
+    let matrix_bridge = if config.has_credentials() {
+        let bridge = MatrixBridge::new(
+            &config,
+            MatrixBridgeConfig {
+                notification_tx: notification_tx.clone(),
+                permission_verdict_tx: permission_verdict_tx.clone(),
+                access_control: access_control.clone(),
+                known_rooms: known_rooms.clone(),
+                pending_permissions: pending_permissions.clone(),
+                cancel: cancel.clone(),
+            },
+        )
+        .await?;
+        Some(bridge)
+    } else {
+        tracing::warn!("Matrix credentials not configured. Run /matrix:configure to set up.");
+        None
+    };
 
-    // MCP server
+    let matrix_client = matrix_bridge.as_ref().map(|b| Arc::new(b.client().clone()));
+
+    // MCP server — handles both setup and full mode
     let mcp_server = MatrixChannelServer::new(McpServerConfig {
         matrix_client,
         access_control,
         known_rooms,
         pending_permissions,
+        notification_tx,
         notification_rx,
+        permission_verdict_tx,
         permission_verdict_rx,
-        store_path: std::path::PathBuf::from(&config.store_path),
+        store_path: PathBuf::from(&config.store_path),
+        env_path,
         cancel: cancel.clone(),
     });
 
-    tracing::info!("Starting Matrix sync + MCP server");
+    if matrix_bridge.is_some() {
+        tracing::info!("Starting Matrix sync + MCP server");
+    } else {
+        tracing::info!("Starting MCP server in setup mode (waiting for credentials)");
+    }
 
     tokio::select! {
-        result = matrix_bridge.run() => {
-            tracing::error!("Matrix sync loop exited: {result:?}");
+        result = async {
+            if let Some(bridge) = matrix_bridge {
+                bridge.run().await
+            } else {
+                // No bridge — wait for cancellation (hot-transition handles bridge startup)
+                cancel.cancelled().await;
+                Ok(())
+            }
+        } => {
+            if let Err(ref e) = result {
+                tracing::error!("Matrix sync loop exited: {e:?}");
+            }
             cancel.cancel();
             result?;
         }

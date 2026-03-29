@@ -352,7 +352,7 @@ dependencies = [
 
 [[package]]
 name = "cc_matrix_channel"
-version = "0.2.1"
+version = "0.2.2-rc1"
 dependencies = [
  "anyhow",
  "clap",

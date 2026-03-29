@@ -115,6 +115,36 @@ cd cc_matrix_channel
 cargo build --release   # Requires Rust 1.85+
 ```
 
+## Testing / Development
+
+### Test an RC build with `--plugin-dir`
+
+The `dev` branch produces pre-release binaries. The Bun launcher downloads the exact version listed in `plugin.json` directly from GitHub Releases, so RC builds work the same as stable ones:
+
+```bash
+git clone https://github.com/IA-PieroCV/cc_matrix_channel
+cd cc_matrix_channel
+git checkout dev
+# In your terminal:
+claude --dangerously-load-development-channels --plugin-dir /path/to/cc_matrix_channel plugin:matrix@cc-matrix-channel
+```
+
+The launcher fetches the RC binary on first run and caches it.
+
+### Test local code changes (no GitHub release needed)
+
+Build the binary and drop it in the launcher's cache path — the launcher skips the download when the file already exists:
+
+```bash
+cargo build --release
+VERSION=$(grep '^version' .claude-plugin/plugin.json | sed 's/.*"\(.*\)".*/\1/')
+cp target/release/cc_matrix_channel \
+   ~/.claude/channels/matrix/plugin-data/bin/cc_matrix_channel-v${VERSION}
+chmod +x ~/.claude/channels/matrix/plugin-data/bin/cc_matrix_channel-v${VERSION}
+```
+
+Then run with `--plugin-dir` as above. Repeat the `cp` after each `cargo build`.
+
 ## Troubleshooting
 
 | Problem | Fix |
