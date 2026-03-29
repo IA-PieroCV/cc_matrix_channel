@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId};
 use rmcp::{
@@ -102,6 +103,7 @@ pub struct McpServerConfig {
     pub notification_rx: mpsc::Receiver<ChannelNotification>,
     pub permission_verdict_rx: mpsc::Receiver<PermissionVerdict>,
     pub store_path: std::path::PathBuf,
+    pub channel_mode: Arc<AtomicBool>,
     pub cancel: CancellationToken,
 }
 
@@ -115,6 +117,7 @@ pub struct MatrixChannelServer {
     notification_rx: Arc<Mutex<Option<mpsc::Receiver<ChannelNotification>>>>,
     permission_verdict_rx: Arc<Mutex<Option<mpsc::Receiver<PermissionVerdict>>>>,
     store_path: std::path::PathBuf,
+    channel_mode: Arc<AtomicBool>,
     cancel: CancellationToken,
     tool_router: ToolRouter<Self>,
 }
@@ -129,6 +132,7 @@ impl MatrixChannelServer {
             notification_rx: Arc::new(Mutex::new(Some(config.notification_rx))),
             permission_verdict_rx: Arc::new(Mutex::new(Some(config.permission_verdict_rx))),
             store_path: config.store_path,
+            channel_mode: config.channel_mode,
             cancel: config.cancel,
             tool_router: Self::tool_router(),
         }
@@ -787,113 +791,133 @@ impl ServerHandler for MatrixChannelServer {
 
     async fn initialize(
         &self,
-        _request: InitializeRequestParams,
+        request: InitializeRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, McpError> {
-        tracing::info!("MCP client connected, starting notification forwarding");
+        let is_channel_session = request
+            .capabilities
+            .experimental
+            .as_ref()
+            .is_some_and(|exp| exp.contains_key("claude/channel"));
 
-        let rx = self.notification_rx.lock().await.take();
-
-        if let Some(mut rx) = rx {
-            let peer = context.peer.clone();
-            let cancel = self.cancel.clone();
-            tokio::spawn(async move {
-                loop {
-                    let notif = tokio::select! {
-                        notif = rx.recv() => {
-                            match notif {
-                                Some(n) => n,
-                                None => {
-                                    tracing::warn!("Notification channel closed");
-                                    break;
-                                }
-                            }
-                        }
-                        _ = cancel.cancelled() => {
-                            tracing::info!("Notification forwarder shutting down");
-                            break;
-                        }
-                    };
-
-                    let mut meta = serde_json::Map::new();
-                    meta.insert("sender".into(), notif.sender.into());
-                    meta.insert("sender_name".into(), notif.sender_display_name.into());
-                    meta.insert("room_id".into(), notif.room_id.into());
-                    meta.insert("event_id".into(), notif.event_id.into());
-                    meta.insert("ts".into(), notif.timestamp.into());
-
-                    // Include attachment metadata as flat string keys
-                    // (Claude Code meta values must be strings — non-strings are dropped)
-                    if !notif.attachments.is_empty() {
-                        meta.insert(
-                            "attachment_count".into(),
-                            notif.attachments.len().to_string().into(),
-                        );
-                        for (i, a) in notif.attachments.iter().enumerate() {
-                            meta.insert(format!("attachment_{i}_name"), a.name.clone().into());
-                            meta.insert(
-                                format!("attachment_{i}_mime_type"),
-                                a.mime_type.clone().into(),
-                            );
-                            meta.insert(format!("attachment_{i}_size"), a.size.to_string().into());
-                            meta.insert(
-                                format!("attachment_{i}_mxc_uri"),
-                                a.mxc_uri.clone().into(),
-                            );
-                        }
-                    }
-
-                    let custom = ServerNotification::CustomNotification(CustomNotification::new(
-                        "notifications/claude/channel",
-                        Some(serde_json::json!({
-                            "content": notif.content,
-                            "meta": meta,
-                        })),
-                    ));
-                    if let Err(e) = peer.send_notification(custom).await {
-                        tracing::error!("Failed to forward notification, MCP peer gone: {e}");
-                        break;
-                    }
-                }
-            });
+        if is_channel_session {
+            tracing::info!(
+                "MCP client connected in channel mode — starting notification forwarding"
+            );
+            self.channel_mode.store(true, Ordering::Relaxed);
+        } else {
+            tracing::info!(
+                "MCP client connected without channel capability — running in passive mode \
+                 (messages will not be forwarded)"
+            );
         }
 
-        // Verdict forwarder — relays permission verdicts from Matrix back to Claude Code
-        let verdict_rx = self.permission_verdict_rx.lock().await.take();
-        if let Some(mut verdict_rx) = verdict_rx {
-            let peer = context.peer.clone();
-            let cancel = self.cancel.clone();
-            let pending = self.pending_permissions.clone();
-            tokio::spawn(async move {
-                loop {
-                    let verdict = tokio::select! {
-                        v = verdict_rx.recv() => match v {
-                            Some(v) => v,
-                            None => break,
-                        },
-                        _ = cancel.cancelled() => break,
-                    };
+        if is_channel_session {
+            // Notification forwarder — relays Matrix messages to Claude Code
+            if let Some(mut rx) = self.notification_rx.lock().await.take() {
+                let peer = context.peer.clone();
+                let cancel = self.cancel.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let notif = tokio::select! {
+                            notif = rx.recv() => {
+                                match notif {
+                                    Some(n) => n,
+                                    None => {
+                                        tracing::warn!("Notification channel closed");
+                                        break;
+                                    }
+                                }
+                            }
+                            _ = cancel.cancelled() => {
+                                tracing::info!("Notification forwarder shutting down");
+                                break;
+                            }
+                        };
 
-                    let notification =
-                        ServerNotification::CustomNotification(CustomNotification::new(
-                            "notifications/claude/channel/permission",
-                            Some(serde_json::json!({
-                                "request_id": verdict.request_id,
-                                "behavior": verdict.behavior,
-                            })),
-                        ));
-                    if let Err(e) = peer.send_notification(notification).await {
-                        tracing::error!("Failed to send permission verdict: {e}");
-                        break;
+                        let mut meta = serde_json::Map::new();
+                        meta.insert("sender".into(), notif.sender.into());
+                        meta.insert("sender_name".into(), notif.sender_display_name.into());
+                        meta.insert("room_id".into(), notif.room_id.into());
+                        meta.insert("event_id".into(), notif.event_id.into());
+                        meta.insert("ts".into(), notif.timestamp.into());
+
+                        // Include attachment metadata as flat string keys
+                        // (Claude Code meta values must be strings — non-strings are dropped)
+                        if !notif.attachments.is_empty() {
+                            meta.insert(
+                                "attachment_count".into(),
+                                notif.attachments.len().to_string().into(),
+                            );
+                            for (i, a) in notif.attachments.iter().enumerate() {
+                                meta.insert(format!("attachment_{i}_name"), a.name.clone().into());
+                                meta.insert(
+                                    format!("attachment_{i}_mime_type"),
+                                    a.mime_type.clone().into(),
+                                );
+                                meta.insert(
+                                    format!("attachment_{i}_size"),
+                                    a.size.to_string().into(),
+                                );
+                                meta.insert(
+                                    format!("attachment_{i}_mxc_uri"),
+                                    a.mxc_uri.clone().into(),
+                                );
+                            }
+                        }
+
+                        let custom =
+                            ServerNotification::CustomNotification(CustomNotification::new(
+                                "notifications/claude/channel",
+                                Some(serde_json::json!({
+                                    "content": notif.content,
+                                    "meta": meta,
+                                })),
+                            ));
+                        if let Err(e) = peer.send_notification(custom).await {
+                            tracing::error!("Failed to forward notification, MCP peer gone: {e}");
+                            break;
+                        }
                     }
-                    pending.lock().remove(&verdict.request_id);
-                    tracing::info!(
-                        "Permission verdict sent: {} -> {}",
-                        verdict.request_id,
-                        verdict.behavior
-                    );
-                }
-            });
+                });
+            }
+
+            // Verdict forwarder — relays permission verdicts from Matrix back to Claude Code
+            if let Some(mut verdict_rx) = self.permission_verdict_rx.lock().await.take() {
+                let peer = context.peer.clone();
+                let cancel = self.cancel.clone();
+                let pending = self.pending_permissions.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let verdict = tokio::select! {
+                            v = verdict_rx.recv() => match v {
+                                Some(v) => v,
+                                None => break,
+                            },
+                            _ = cancel.cancelled() => break,
+                        };
+
+                        let notification =
+                            ServerNotification::CustomNotification(CustomNotification::new(
+                                "notifications/claude/channel/permission",
+                                Some(serde_json::json!({
+                                    "request_id": verdict.request_id,
+                                    "behavior": verdict.behavior,
+                                })),
+                            ));
+                        if let Err(e) = peer.send_notification(notification).await {
+                            tracing::error!("Failed to send permission verdict: {e}");
+                            break;
+                        }
+                        pending.lock().remove(&verdict.request_id);
+                        tracing::info!(
+                            "Permission verdict sent: {} -> {}",
+                            verdict.request_id,
+                            verdict.behavior
+                        );
+                    }
+                });
+            }
         }
 
         Ok(self.get_info())

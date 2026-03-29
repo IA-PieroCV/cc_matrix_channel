@@ -1,6 +1,6 @@
 [package]
 name = "cc_matrix_channel"
-version = "0.2.0"
+version = "0.2.2-rc1"
 edition = "2024"
 description = "Matrix channel bridge for Claude Code — two-way MCP server"
 license = "MIT"

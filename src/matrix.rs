@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -85,6 +86,30 @@ pub struct ChannelNotification {
     pub attachments: Vec<AttachmentMeta>,
 }
 
+/// Configuration for constructing a [`MatrixBridge`].
+pub struct MatrixBridgeConfig {
+    pub notification_tx: mpsc::Sender<ChannelNotification>,
+    pub permission_verdict_tx: mpsc::Sender<PermissionVerdict>,
+    pub access_control: Arc<AccessControl>,
+    pub known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
+    pub pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>>,
+    pub channel_mode: Arc<AtomicBool>,
+    pub cancel: CancellationToken,
+}
+
+/// Shared state captured by the Matrix event handler closure.
+#[derive(Clone)]
+struct MessageHandlerCtx {
+    tx: mpsc::Sender<ChannelNotification>,
+    permission_verdict_tx: mpsc::Sender<PermissionVerdict>,
+    pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>>,
+    access: Arc<AccessControl>,
+    own_user_id: OwnedUserId,
+    known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
+    channel_mode: Arc<AtomicBool>,
+    start_time: Instant,
+}
+
 pub struct MatrixBridge {
     client: Client,
     own_user_id: OwnedUserId,
@@ -93,20 +118,22 @@ pub struct MatrixBridge {
     access_control: Arc<AccessControl>,
     known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
     pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>>,
+    channel_mode: Arc<AtomicBool>,
     start_time: Instant,
     cancel: CancellationToken,
 }
 
 impl MatrixBridge {
-    pub async fn new(
-        config: &Config,
-        notification_tx: mpsc::Sender<ChannelNotification>,
-        permission_verdict_tx: mpsc::Sender<PermissionVerdict>,
-        access_control: Arc<AccessControl>,
-        known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
-        pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>>,
-        cancel: CancellationToken,
-    ) -> Result<Self> {
+    pub async fn new(config: &Config, bridge_config: MatrixBridgeConfig) -> Result<Self> {
+        let MatrixBridgeConfig {
+            notification_tx,
+            permission_verdict_tx,
+            access_control,
+            known_rooms,
+            pending_permissions,
+            channel_mode,
+            cancel,
+        } = bridge_config;
         tokio::fs::create_dir_all(&config.store_path).await?;
 
         let homeserver_url = config
@@ -258,6 +285,7 @@ impl MatrixBridge {
             access_control,
             pending_permissions,
             known_rooms,
+            channel_mode,
             start_time: Instant::now(),
             cancel,
         })
@@ -270,43 +298,30 @@ impl MatrixBridge {
     pub async fn run(&self) -> Result<()> {
         self.client.add_event_handler(Self::handle_invite);
 
-        let tx = self.notification_tx.clone();
-        let verdict_tx = self.permission_verdict_tx.clone();
-        let pending_permissions = self.pending_permissions.clone();
-        let access = self.access_control.clone();
-        let own_user_id = self.own_user_id.clone();
-        let known_rooms = self.known_rooms.clone();
-        let start_time = self.start_time;
+        let ctx = MessageHandlerCtx {
+            tx: self.notification_tx.clone(),
+            permission_verdict_tx: self.permission_verdict_tx.clone(),
+            pending_permissions: self.pending_permissions.clone(),
+            access: self.access_control.clone(),
+            own_user_id: self.own_user_id.clone(),
+            known_rooms: self.known_rooms.clone(),
+            channel_mode: self.channel_mode.clone(),
+            start_time: self.start_time,
+        };
 
         // Use Raw<AnySyncTimelineEvent> for manual deserialization — more robust than
         // typed OriginalSyncRoomMessageEvent which silently skips on deserialization failure
         // (known issue with encrypted media events in matrix-sdk v0.9)
         self.client
             .add_event_handler(move |raw: Raw<AnySyncTimelineEvent>, room: Room| {
-                let tx = tx.clone();
-                let verdict_tx = verdict_tx.clone();
-                let pending_permissions = pending_permissions.clone();
-                let access = access.clone();
-                let own_user_id = own_user_id.clone();
-                let known_rooms = known_rooms.clone();
+                let ctx = ctx.clone();
                 async move {
                     match raw.deserialize() {
                         Ok(AnySyncTimelineEvent::MessageLike(
                             AnySyncMessageLikeEvent::RoomMessage(msg),
                         )) => {
                             if let Some(original) = msg.as_original() {
-                                Self::handle_message(
-                                    original.clone(),
-                                    room,
-                                    tx,
-                                    verdict_tx,
-                                    pending_permissions,
-                                    access,
-                                    own_user_id,
-                                    known_rooms,
-                                    start_time,
-                                )
-                                .await;
+                                Self::handle_message(original.clone(), room, ctx).await;
                             }
                         }
                         Ok(_) => {} // non-message timeline events
@@ -346,18 +361,22 @@ impl MatrixBridge {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn handle_message(
         event: OriginalSyncRoomMessageEvent,
         room: Room,
-        tx: mpsc::Sender<ChannelNotification>,
-        permission_verdict_tx: mpsc::Sender<PermissionVerdict>,
-        pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>>,
-        access: Arc<AccessControl>,
-        own_user_id: OwnedUserId,
-        known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
-        start_time: Instant,
+        ctx: MessageHandlerCtx,
     ) {
+        let MessageHandlerCtx {
+            tx,
+            permission_verdict_tx,
+            pending_permissions,
+            access,
+            own_user_id,
+            known_rooms,
+            channel_mode,
+            start_time,
+        } = ctx;
+
         if event.sender == own_user_id {
             return;
         }
@@ -501,6 +520,12 @@ impl MatrixBridge {
         let current_room_id = room.room_id().to_owned();
         match access.check_sender(&sender_id, &current_room_id) {
             Ok(()) => {
+                // If the MCP client isn't in a channel session, drop silently — no
+                // misleading 👀 ack reaction or typing indicator.
+                if !channel_mode.load(Ordering::Relaxed) {
+                    return;
+                }
+
                 known_rooms.lock().insert(room.room_id().to_owned());
 
                 // Permission verdict interception — only for pending requests from approved users

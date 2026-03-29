@@ -23,13 +23,22 @@ Requires [Bun](https://bun.sh).
 /plugin marketplace add IA-PieroCV/cc_matrix_channel
 /plugin install matrix@cc-matrix-channel
 /reload-plugins
+# You must need to restart your session to get the slash commands working and connect to the channel MCP
+# claude --dangerously-load-development-channels plugin:matrix@cc-matrix-channel
+/configure https://matrix.example.com @bot:example.com YOUR_PASSWORD
+OR
 /matrix:configure https://matrix.example.com @bot:example.com YOUR_PASSWORD
 ```
 
 Then pair your account — DM the bot from your Matrix client:
 
 ```
+/access pair <code>
+OR
 /matrix:access pair <code>
+
+/access policy allowlist
+OR
 /matrix:access policy allowlist
 ```
 
@@ -105,6 +114,36 @@ git clone https://github.com/IA-PieroCV/cc_matrix_channel
 cd cc_matrix_channel
 cargo build --release   # Requires Rust 1.85+
 ```
+
+## Testing / Development
+
+### Test an RC build with `--plugin-dir`
+
+The `dev` branch produces pre-release binaries. The Bun launcher downloads the exact version listed in `plugin.json` directly from GitHub Releases, so RC builds work the same as stable ones:
+
+```bash
+git clone https://github.com/IA-PieroCV/cc_matrix_channel
+cd cc_matrix_channel
+git checkout dev
+# In your terminal:
+claude --dangerously-load-development-channels --plugin-dir /path/to/cc_matrix_channel plugin:matrix@cc-matrix-channel
+```
+
+The launcher fetches the RC binary on first run and caches it.
+
+### Test local code changes (no GitHub release needed)
+
+Build the binary and drop it in the launcher's cache path — the launcher skips the download when the file already exists:
+
+```bash
+cargo build --release
+VERSION=$(grep '^version' .claude-plugin/plugin.json | sed 's/.*"\(.*\)".*/\1/')
+cp target/release/cc_matrix_channel \
+   ~/.claude/channels/matrix/plugin-data/bin/cc_matrix_channel-v${VERSION}
+chmod +x ~/.claude/channels/matrix/plugin-data/bin/cc_matrix_channel-v${VERSION}
+```
+
+Then run with `--plugin-dir` as above. Repeat the `cp` after each `cargo build`.
 
 ## Troubleshooting
 
