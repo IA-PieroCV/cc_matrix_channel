@@ -187,6 +187,15 @@ impl MatrixBridge {
                 resp.user_id,
                 saved.device_id
             );
+            // Re-run E2EE initialization on restore — ensures cross-signing keys are
+            // active and the device is signed. Without this, a device that was
+            // cross-signed after first login loses its verification on restart.
+            tracing::info!("Running E2EE initialization tasks on session restore...");
+            client
+                .encryption()
+                .wait_for_e2ee_initialization_tasks()
+                .await;
+            tracing::info!("E2EE initialization tasks complete");
         } else if let Some(ref password) = config.password {
             // Path 2: First-run login with password
             tracing::info!("First-run login for {}", user_id);

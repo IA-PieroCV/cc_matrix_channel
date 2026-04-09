@@ -33,10 +33,19 @@ async fn main() -> Result<()> {
 
     tracing::info!("cc_matrix_channel v{} starting", env!("CARGO_PKG_VERSION"));
 
+    // Resolve channel directory — MATRIX_CHANNEL_DIR overrides the default.
+    // This allows multiple agent sessions to each have their own credentials
+    // and access config by pointing to different per-agent directories.
+    let channel_dir = std::env::var("MATRIX_CHANNEL_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            dirs_next::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".claude/channels/matrix")
+        });
+
     // Load .env file if present (process env vars from .mcp.json take precedence)
-    let env_path = dirs_next::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".claude/channels/matrix/.env");
+    let env_path = channel_dir.join(".env");
     if env_path.exists() {
         dotenvy::from_path(&env_path).ok();
         tracing::info!("Loaded .env from {}", env_path.display());
@@ -101,12 +110,7 @@ async fn main() -> Result<()> {
     }
 
     // Shared state
-    let config_path = dirs_next::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".claude")
-        .join("channels")
-        .join("matrix")
-        .join("access.json");
+    let config_path = channel_dir.join("access.json");
     let access_control = Arc::new(AccessControl::new(config_path));
     let (notification_tx, notification_rx) = mpsc::channel::<ChannelNotification>(256);
     let (permission_verdict_tx, permission_verdict_rx) = mpsc::channel::<PermissionVerdict>(16);

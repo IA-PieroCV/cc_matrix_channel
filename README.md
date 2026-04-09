@@ -80,6 +80,28 @@ claude --dangerously-load-development-channels plugin:matrix@cc-matrix-channel
 | `MATRIX_ACCESS_TOKEN` | No | Fallback auth (limited E2EE) |
 | `MATRIX_DEVICE_ID` | No | Device ID hint (auto-generated) |
 | `MATRIX_STORE_PASSPHRASE` | No | Encrypt store at rest |
+| `MATRIX_CHANNEL_DIR` | No | Base directory for `.env` and `access.json` (default: `~/.claude/channels/matrix`) |
+
+#### Multi-agent setup with `MATRIX_CHANNEL_DIR`
+
+By default the plugin reads `.env` and `access.json` from `~/.claude/channels/matrix/`. When running
+multiple Claude Code agent sessions — each with its own Matrix account — set `MATRIX_CHANNEL_DIR`
+to a per-agent directory so they don't share credentials or access config:
+
+```bash
+# Agent "ziggy" uses ~/.claude/channels/matrix-ziggy/
+MATRIX_CHANNEL_DIR=~/.claude/channels/matrix-ziggy \
+MATRIX_STORE_PATH=~/.claude/channels/matrix-ziggy/matrix_store \
+claude --dangerously-load-development-channels plugin:matrix@cc-matrix-channel
+
+# Agent "bernard" uses ~/.claude/channels/matrix-bernard/
+MATRIX_CHANNEL_DIR=~/.claude/channels/matrix-bernard \
+MATRIX_STORE_PATH=~/.claude/channels/matrix-bernard/matrix_store \
+claude --dangerously-load-development-channels plugin:matrix@cc-matrix-channel
+```
+
+Each per-agent directory contains its own `.env` (credentials) and `access.json` (access policy).
+`MATRIX_STORE_PATH` should also be set per-agent for E2EE key isolation.
 
 ### Access & Delivery (`~/.claude/channels/matrix/access.json`)
 
