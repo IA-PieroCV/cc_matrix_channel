@@ -167,9 +167,9 @@ fn slug_for_cwd(cwd: &Path) -> String {
 pub enum TranscriptSource {
     /// Resolved directly from `CLAUDE_CODE_SESSION_ID` — this session's own transcript.
     SessionId,
-    /// `CLAUDE_CODE_SESSION_ID` was unset, or named a file that did not exist yet. This is
-    /// the most recently modified transcript in the project directory, which may belong to
-    /// another session entirely.
+    /// `CLAUDE_CODE_SESSION_ID` was unset. This is the most recently modified transcript
+    /// in the project directory, which may belong to another session entirely — so it is
+    /// only ever used when there is no session id to be more precise with.
     NewestFallback,
 }
 
@@ -184,10 +184,11 @@ impl fmt::Display for TranscriptSource {
 
 /// Locate this session's transcript.
 ///
-/// Prefers `CLAUDE_CODE_SESSION_ID`, which Claude Code sets in the environment MCP servers
-/// inherit. Falls back to the most recently modified `*.jsonl` in the project directory,
-/// which is right often enough to be useful and is clearly labelled `Unknown` when it is
-/// not there at all.
+/// Uses `CLAUDE_CODE_SESSION_ID`, which Claude Code sets in the environment MCP servers
+/// inherit. When that names a transcript that does not exist yet — the normal state of a
+/// session nobody has messaged since it started — the answer is `None`, which reads out as
+/// `Unknown` and is never broadcast. Only with no session id at all does this fall back to
+/// the most recently modified `*.jsonl` in the project directory.
 pub fn transcript_path() -> Option<PathBuf> {
     transcript_path_with_source().map(|(p, _)| p)
 }
@@ -197,15 +198,25 @@ pub fn transcript_path_with_source() -> Option<(PathBuf, TranscriptSource)> {
     let home = dirs_next::home_dir()?;
     let cwd = std::env::current_dir().ok()?;
     let project_dir = home.join(".claude/projects").join(slug_for_cwd(&cwd));
+    let session_id = std::env::var("CLAUDE_CODE_SESSION_ID").ok();
 
-    if let Ok(id) = std::env::var("CLAUDE_CODE_SESSION_ID") {
+    resolve_transcript(&project_dir, session_id.as_deref())
+}
+
+/// The resolution rule, separated from the environment it normally reads so it can be
+/// tested against a fixture directory.
+fn resolve_transcript(
+    project_dir: &Path,
+    session_id: Option<&str>,
+) -> Option<(PathBuf, TranscriptSource)> {
+    if let Some(id) = session_id {
         let direct = project_dir.join(format!("{id}.jsonl"));
-        if direct.is_file() {
-            return Some((direct, TranscriptSource::SessionId));
-        }
+        return direct
+            .is_file()
+            .then_some((direct, TranscriptSource::SessionId));
     }
 
-    newest_jsonl(&project_dir).map(|p| (p, TranscriptSource::NewestFallback))
+    newest_jsonl(project_dir).map(|p| (p, TranscriptSource::NewestFallback))
 }
 
 fn newest_jsonl(dir: &Path) -> Option<PathBuf> {
@@ -623,6 +634,46 @@ mod tests {
         let s = read_status_at(&path, STALL, at("2026-08-08T12:00:06.000Z"));
         assert_eq!(s.state, AgentState::Working);
         assert_eq!(s.last_tool.as_deref(), Some("Bash"));
+    }
+
+    /// A session that has not been messaged since it started has no transcript yet, and
+    /// every session sharing a working directory shares this project directory. Falling
+    /// back to "newest" here hands the bridge a *different* session's transcript, and it
+    /// then reports a stranger's liveness into the room as if it were its own. No
+    /// information is the honest answer.
+    #[test]
+    fn session_id_with_no_transcript_yet_refuses_to_guess() {
+        let dir = tempfile::tempdir().unwrap();
+        File::create(dir.path().join("another-session.jsonl")).unwrap();
+
+        let resolved = resolve_transcript(dir.path(), Some("my-session"));
+
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn session_id_resolves_to_that_sessions_own_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        File::create(dir.path().join("my-session.jsonl")).unwrap();
+        File::create(dir.path().join("another-session.jsonl")).unwrap();
+
+        let (path, source) = resolve_transcript(dir.path(), Some("my-session")).unwrap();
+
+        assert_eq!(path, dir.path().join("my-session.jsonl"));
+        assert_eq!(source, TranscriptSource::SessionId);
+    }
+
+    /// Without a session id there is nothing more precise to go on, so the newest
+    /// transcript remains the best available guess.
+    #[test]
+    fn without_a_session_id_the_newest_transcript_is_still_used() {
+        let dir = tempfile::tempdir().unwrap();
+        File::create(dir.path().join("only-session.jsonl")).unwrap();
+
+        let (path, source) = resolve_transcript(dir.path(), None).unwrap();
+
+        assert_eq!(path, dir.path().join("only-session.jsonl"));
+        assert_eq!(source, TranscriptSource::NewestFallback);
     }
 
     #[test]
