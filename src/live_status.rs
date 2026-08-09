@@ -21,8 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use matrix_sdk::Client;
-use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId};
 use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
+use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId};
 use tokio_util::sync::CancellationToken;
 
 use crate::status::{AgentState, AgentStatus, read_status, stall_threshold};
@@ -220,7 +220,10 @@ fn target_room(
 /// homeserver by `live_draft_cycle_against_real_homeserver` below.
 async fn send_status(client: &Client, room_id: &OwnedRoomId, body: &str) -> Option<OwnedEventId> {
     let room = client.get_room(room_id)?;
-    match room.send(RoomMessageEventContent::text_markdown(body)).await {
+    match room
+        .send(RoomMessageEventContent::text_markdown(body))
+        .await
+    {
         Ok(resp) => Some(resp.event_id),
         Err(e) => {
             tracing::warn!("Failed to send status message: {e}");
@@ -396,7 +399,14 @@ mod tests {
     #[test]
     fn subsequent_working_ticks_edit_rather_than_send() {
         assert_eq!(
-            decide(Some(AgentState::Working), AgentState::Working, true, true, Some(LONG), DELAY),
+            decide(
+                Some(AgentState::Working),
+                AgentState::Working,
+                true,
+                true,
+                Some(LONG),
+                DELAY
+            ),
             Action::EditDraft
         );
     }
@@ -405,7 +415,14 @@ mod tests {
     #[test]
     fn unchanged_render_sends_nothing() {
         assert_eq!(
-            decide(Some(AgentState::Working), AgentState::Working, true, false, Some(LONG), DELAY),
+            decide(
+                Some(AgentState::Working),
+                AgentState::Working,
+                true,
+                false,
+                Some(LONG),
+                DELAY
+            ),
             Action::Nothing
         );
     }
@@ -508,12 +525,26 @@ mod tests {
     fn terminal_state_is_announced_once() {
         // Enters Stalled: close the draft, which consumes it.
         assert_eq!(
-            decide(Some(AgentState::Working), AgentState::Stalled, true, true, None, DELAY),
+            decide(
+                Some(AgentState::Working),
+                AgentState::Stalled,
+                true,
+                true,
+                None,
+                DELAY
+            ),
             Action::CloseDraft
         );
         // Still stalled next tick, draft now closed: silence.
         assert_eq!(
-            decide(Some(AgentState::Stalled), AgentState::Stalled, false, true, None, DELAY),
+            decide(
+                Some(AgentState::Stalled),
+                AgentState::Stalled,
+                false,
+                true,
+                None,
+                DELAY
+            ),
             Action::Nothing
         );
     }
@@ -567,7 +598,14 @@ mod tests {
     #[test]
     fn unknown_state_is_never_broadcast() {
         assert_eq!(
-            decide(Some(AgentState::Working), AgentState::Unknown, true, true, Some(LONG), DELAY),
+            decide(
+                Some(AgentState::Working),
+                AgentState::Unknown,
+                true,
+                true,
+                Some(LONG),
+                DELAY
+            ),
             Action::Nothing
         );
     }

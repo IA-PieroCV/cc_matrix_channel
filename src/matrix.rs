@@ -531,11 +531,7 @@ impl MatrixBridge {
                 };
                 if newly_known || room_changed {
                     let rooms = known_rooms.lock().clone();
-                    crate::rooms::save(
-                        &crate::rooms::store_path(),
-                        &rooms,
-                        Some(&current_room_id),
-                    );
+                    crate::rooms::save(&crate::rooms::store_path(), &rooms, Some(&current_room_id));
                 }
 
                 // Permission verdict interception — only for pending requests from approved users

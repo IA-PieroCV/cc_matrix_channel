@@ -61,7 +61,11 @@ pub fn load(path: &Path) -> (HashSet<OwnedRoomId>, Option<OwnedRoomId>) {
         .filter(|r| rooms.contains(r));
 
     if !rooms.is_empty() {
-        tracing::info!("Restored {} known room(s) from {}", rooms.len(), path.display());
+        tracing::info!(
+            "Restored {} known room(s) from {}",
+            rooms.len(),
+            path.display()
+        );
     }
     (rooms, last_active)
 }

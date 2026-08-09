@@ -148,7 +148,13 @@ pub fn stall_threshold() -> Duration {
 fn slug_for_cwd(cwd: &Path) -> String {
     let s = cwd.to_string_lossy();
     s.chars()
-        .map(|c| if c == '/' || c == '.' || c == '_' { '-' } else { c })
+        .map(|c| {
+            if c == '/' || c == '.' || c == '_' {
+                '-'
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -429,7 +435,10 @@ mod tests {
         // Expected values cross-checked against `date -u -d <ts> +%s`.
         // 2026-08-08T12:00:00Z == 1786190400
         let t = at("2026-08-08T12:00:00.000Z");
-        assert_eq!(t.duration_since(UNIX_EPOCH).unwrap().as_secs(), 1_786_190_400);
+        assert_eq!(
+            t.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            1_786_190_400
+        );
         // Epoch itself, and a leap day.
         assert_eq!(
             at("1970-01-01T00:00:00.000Z")
