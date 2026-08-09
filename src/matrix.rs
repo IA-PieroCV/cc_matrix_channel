@@ -91,6 +91,8 @@ pub struct MatrixBridgeConfig {
     pub permission_verdict_tx: mpsc::Sender<PermissionVerdict>,
     pub access_control: Arc<AccessControl>,
     pub known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
+    /// Room that most recently passed the access check — where live status is posted.
+    pub last_active_room: Arc<parking_lot::Mutex<Option<OwnedRoomId>>>,
     pub pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>>,
     pub cancel: CancellationToken,
 }
@@ -104,6 +106,7 @@ struct MessageHandlerCtx {
     access: Arc<AccessControl>,
     own_user_id: OwnedUserId,
     known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
+    last_active_room: Arc<parking_lot::Mutex<Option<OwnedRoomId>>>,
     start_time: Instant,
 }
 
@@ -114,6 +117,7 @@ pub struct MatrixBridge {
     permission_verdict_tx: mpsc::Sender<PermissionVerdict>,
     access_control: Arc<AccessControl>,
     known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
+    last_active_room: Arc<parking_lot::Mutex<Option<OwnedRoomId>>>,
     pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>>,
     start_time: Instant,
     cancel: CancellationToken,
@@ -126,6 +130,7 @@ impl MatrixBridge {
             permission_verdict_tx,
             access_control,
             known_rooms,
+            last_active_room,
             pending_permissions,
             cancel,
         } = bridge_config;
@@ -280,6 +285,7 @@ impl MatrixBridge {
             access_control,
             pending_permissions,
             known_rooms,
+            last_active_room,
             start_time: Instant::now(),
             cancel,
         })
@@ -299,6 +305,7 @@ impl MatrixBridge {
             access: self.access_control.clone(),
             own_user_id: self.own_user_id.clone(),
             known_rooms: self.known_rooms.clone(),
+            last_active_room: self.last_active_room.clone(),
             start_time: self.start_time,
         };
 
@@ -366,6 +373,7 @@ impl MatrixBridge {
             access,
             own_user_id,
             known_rooms,
+            last_active_room,
             start_time,
         } = ctx;
 
@@ -512,7 +520,19 @@ impl MatrixBridge {
         let current_room_id = room.room_id().to_owned();
         match access.check_sender(&sender_id, &current_room_id) {
             Ok(()) => {
-                known_rooms.lock().insert(room.room_id().to_owned());
+                // Remember this room, and remember it is the most recent one — live status
+                // posts there. Persisted so a bridge restart does not go silent.
+                let newly_known = known_rooms.lock().insert(current_room_id.clone());
+                let room_changed = {
+                    let mut last = last_active_room.lock();
+                    let changed = last.as_ref() != Some(&current_room_id);
+                    *last = Some(current_room_id.clone());
+                    changed
+                };
+                if newly_known || room_changed {
+                    let rooms = known_rooms.lock().clone();
+                    crate::rooms::save(&crate::rooms::store_path(), &rooms, Some(&current_room_id));
+                }
 
                 // Permission verdict interception — only for pending requests from approved users
                 if let Some(verdict) = parse_permission_verdict(&text)
@@ -622,8 +642,12 @@ impl MatrixBridge {
                 let uptime = start_time.elapsed();
                 let hours = uptime.as_secs() / 3600;
                 let minutes = (uptime.as_secs() % 3600) / 60;
+                // Answered by the bridge itself and never forwarded to Claude, so this
+                // keeps working when the agent is the thing that is wedged.
+                let agent = crate::status::read_status(crate::status::stall_threshold());
                 Some(format!(
-                    "Status: online\nUptime: {hours}h {minutes}m\nSession: active"
+                    "Bridge:   online, uptime {hours}h {minutes}m\n{}",
+                    agent.render()
                 ))
             }
             _ => None,

@@ -99,6 +99,7 @@ pub struct McpServerConfig {
     pub matrix_client: Option<Arc<matrix_sdk::Client>>,
     pub access_control: Arc<AccessControl>,
     pub known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
+    pub last_active_room: Arc<parking_lot::Mutex<Option<OwnedRoomId>>>,
     pub pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>>,
     pub notification_tx: mpsc::Sender<ChannelNotification>,
     pub notification_rx: mpsc::Receiver<ChannelNotification>,
@@ -116,6 +117,7 @@ pub struct MatrixChannelServer {
     matrix_client: Arc<std::sync::OnceLock<Arc<matrix_sdk::Client>>>,
     access_control: Arc<AccessControl>,
     known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>>,
+    last_active_room: Arc<parking_lot::Mutex<Option<OwnedRoomId>>>,
     pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>>,
     notification_tx: mpsc::Sender<ChannelNotification>,
     notification_rx: Arc<Mutex<Option<mpsc::Receiver<ChannelNotification>>>>,
@@ -137,6 +139,7 @@ impl MatrixChannelServer {
             matrix_client: client_lock,
             access_control: config.access_control,
             known_rooms: config.known_rooms,
+            last_active_room: config.last_active_room,
             pending_permissions: config.pending_permissions,
             notification_tx: config.notification_tx,
             notification_rx: Arc::new(Mutex::new(Some(config.notification_rx))),
@@ -1104,6 +1107,7 @@ impl MatrixChannelServer {
                 permission_verdict_tx: self.permission_verdict_tx.clone(),
                 access_control: self.access_control.clone(),
                 known_rooms: self.known_rooms.clone(),
+                last_active_room: self.last_active_room.clone(),
                 pending_permissions: self.pending_permissions.clone(),
                 cancel: self.cancel.clone(),
             },
@@ -1112,8 +1116,18 @@ impl MatrixChannelServer {
 
         let client = Arc::new(bridge.client().clone());
         self.matrix_client
-            .set(client)
+            .set(client.clone())
             .map_err(|_| anyhow::anyhow!("Client already set"))?;
+
+        // Start live status here too: main() only spawns it when credentials already
+        // exist at startup, so without this the feature stays dead for any bridge that
+        // came up in setup mode and hot-transitioned.
+        crate::live_status::spawn(
+            client,
+            self.known_rooms.clone(),
+            self.last_active_room.clone(),
+            self.cancel.clone(),
+        );
 
         // Spawn Matrix sync loop
         let cancel = self.cancel.clone();

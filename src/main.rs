@@ -1,7 +1,10 @@
 mod access;
 mod config;
+mod live_status;
 mod matrix;
 mod mcp;
+mod rooms;
+mod status;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -110,8 +113,13 @@ async fn main() -> Result<()> {
     let access_control = Arc::new(AccessControl::new(config_path));
     let (notification_tx, notification_rx) = mpsc::channel::<ChannelNotification>(256);
     let (permission_verdict_tx, permission_verdict_rx) = mpsc::channel::<PermissionVerdict>(16);
+    // Restored from disk so a restart does not forget where to post status — otherwise the
+    // liveness feature goes silent until someone messages the bridge again.
+    let (restored_rooms, restored_last_active) = rooms::load(&rooms::store_path());
     let known_rooms: Arc<parking_lot::Mutex<HashSet<OwnedRoomId>>> =
-        Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        Arc::new(parking_lot::Mutex::new(restored_rooms));
+    let last_active_room: Arc<parking_lot::Mutex<Option<OwnedRoomId>>> =
+        Arc::new(parking_lot::Mutex::new(restored_last_active));
     let pending_permissions: Arc<parking_lot::Mutex<HashSet<String>>> =
         Arc::new(parking_lot::Mutex::new(HashSet::new()));
 
@@ -124,6 +132,7 @@ async fn main() -> Result<()> {
                 permission_verdict_tx: permission_verdict_tx.clone(),
                 access_control: access_control.clone(),
                 known_rooms: known_rooms.clone(),
+                last_active_room: last_active_room.clone(),
                 pending_permissions: pending_permissions.clone(),
                 cancel: cancel.clone(),
             },
@@ -137,11 +146,23 @@ async fn main() -> Result<()> {
 
     let matrix_client = matrix_bridge.as_ref().map(|b| Arc::new(b.client().clone()));
 
+    // Live agent-status message. Alongside the parent-PID poll above, this is the other
+    // signal that does not depend on the agent being responsive enough to speak for itself.
+    if let Some(client) = matrix_client.clone() {
+        live_status::spawn(
+            client,
+            known_rooms.clone(),
+            last_active_room.clone(),
+            cancel.clone(),
+        );
+    }
+
     // MCP server — handles both setup and full mode
     let mcp_server = MatrixChannelServer::new(McpServerConfig {
         matrix_client,
         access_control,
         known_rooms,
+        last_active_room,
         pending_permissions,
         notification_tx,
         notification_rx,
