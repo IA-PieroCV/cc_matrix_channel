@@ -158,6 +158,30 @@ fn slug_for_cwd(cwd: &Path) -> String {
         .collect()
 }
 
+/// How [`transcript_path`] resolved the transcript.
+///
+/// Worth surfacing rather than keeping internal: the fallback can silently point the bridge
+/// at a *different session's* transcript, and a bridge reading someone else's liveness looks
+/// identical from the outside to one reading its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptSource {
+    /// Resolved directly from `CLAUDE_CODE_SESSION_ID` — this session's own transcript.
+    SessionId,
+    /// `CLAUDE_CODE_SESSION_ID` was unset, or named a file that did not exist yet. This is
+    /// the most recently modified transcript in the project directory, which may belong to
+    /// another session entirely.
+    NewestFallback,
+}
+
+impl fmt::Display for TranscriptSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SessionId => write!(f, "session-id"),
+            Self::NewestFallback => write!(f, "newest-fallback"),
+        }
+    }
+}
+
 /// Locate this session's transcript.
 ///
 /// Prefers `CLAUDE_CODE_SESSION_ID`, which Claude Code sets in the environment MCP servers
@@ -165,6 +189,11 @@ fn slug_for_cwd(cwd: &Path) -> String {
 /// which is right often enough to be useful and is clearly labelled `Unknown` when it is
 /// not there at all.
 pub fn transcript_path() -> Option<PathBuf> {
+    transcript_path_with_source().map(|(p, _)| p)
+}
+
+/// As [`transcript_path`], but also reports which branch produced the answer.
+pub fn transcript_path_with_source() -> Option<(PathBuf, TranscriptSource)> {
     let home = dirs_next::home_dir()?;
     let cwd = std::env::current_dir().ok()?;
     let project_dir = home.join(".claude/projects").join(slug_for_cwd(&cwd));
@@ -172,11 +201,11 @@ pub fn transcript_path() -> Option<PathBuf> {
     if let Ok(id) = std::env::var("CLAUDE_CODE_SESSION_ID") {
         let direct = project_dir.join(format!("{id}.jsonl"));
         if direct.is_file() {
-            return Some(direct);
+            return Some((direct, TranscriptSource::SessionId));
         }
     }
 
-    newest_jsonl(&project_dir)
+    newest_jsonl(&project_dir).map(|p| (p, TranscriptSource::NewestFallback))
 }
 
 fn newest_jsonl(dir: &Path) -> Option<PathBuf> {

@@ -277,11 +277,34 @@ pub fn spawn(
     tokio::spawn(async move {
         let threshold = stall_threshold();
         let delay = draft_delay();
+
+        match crate::status::transcript_path_with_source() {
+            Some((path, source)) => tracing::info!(
+                transcript = %path.display(),
+                %source,
+                draft_delay_secs = delay.as_secs(),
+                stall_threshold_secs = threshold.as_secs(),
+                tick_secs = TICK.as_secs(),
+                "Live status loop starting"
+            ),
+            None => tracing::info!(
+                transcript = "none",
+                draft_delay_secs = delay.as_secs(),
+                stall_threshold_secs = threshold.as_secs(),
+                "Live status loop starting with no transcript resolved"
+            ),
+        }
+
         let mut interval = tokio::time::interval(TICK);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         let mut previous: Option<AgentState> = None;
         let mut draft: Option<Draft> = None;
+        // Which transcript the last tick read. Logged on change: a mid-run switch means the
+        // fallback was in play, and a spell measured against another session's activity is
+        // not this session's spell at all.
+        let mut last_transcript: Option<(std::path::PathBuf, crate::status::TranscriptSource)> =
+            None;
         // Measured locally rather than from `turn_elapsed`, which is None once the opening
         // prompt scrolls out of the transcript tail — exactly on the long turns that need
         // a draft most.
@@ -295,9 +318,46 @@ pub fn spawn(
 
             let status = read_status(threshold);
 
+            // Report a transcript switch before anything else: it reframes every number
+            // logged below it.
+            let resolved = crate::status::transcript_path_with_source();
+            if resolved != last_transcript {
+                match (&resolved, &last_transcript) {
+                    (Some((path, source)), None) => tracing::info!(
+                        transcript = %path.display(),
+                        %source,
+                        "Status transcript resolved"
+                    ),
+                    (Some((path, source)), Some((old_path, old_source))) => tracing::info!(
+                        transcript = %path.display(),
+                        %source,
+                        previous_transcript = %old_path.display(),
+                        previous_source = %old_source,
+                        "Status transcript changed"
+                    ),
+                    (None, _) => tracing::info!("Status transcript no longer resolvable"),
+                }
+                last_transcript = resolved;
+            }
+
             if matches!(status.state, AgentState::Working) {
+                if working_since.is_none() {
+                    tracing::info!(
+                        state = %status.state,
+                        last_activity_age_secs = status.last_activity_age.map(|d| d.as_secs()),
+                        turn_elapsed_secs = status.turn_elapsed.map(|d| d.as_secs()),
+                        "Working spell started (draft clock anchored here)"
+                    );
+                }
                 working_since.get_or_insert_with(std::time::Instant::now);
             } else {
+                if working_since.is_some() {
+                    tracing::info!(
+                        state = %status.state,
+                        spell_age_secs = working_since.map(|t| t.elapsed().as_secs()),
+                        "Working spell ended (draft clock reset)"
+                    );
+                }
                 working_since = None;
             }
             let working_for = working_since.map(|t| t.elapsed());
@@ -308,23 +368,57 @@ pub fn spawn(
             };
             let changed = draft.as_ref().is_none_or(|d| d.rendered != body);
 
-            match decide(
+            let action = decide(
                 previous,
                 status.state,
                 draft.is_some(),
                 changed,
                 working_for,
                 delay,
-            ) {
+            );
+
+            // Every tick at debug; anything that costs a send at info. Metadata only — the
+            // rendered body is never logged, per the privacy note in `crate::status`.
+            if action == Action::Nothing {
+                tracing::debug!(
+                    ?action,
+                    state = %status.state,
+                    previous = ?previous,
+                    has_draft = draft.is_some(),
+                    changed,
+                    spell_age_secs = working_for.map(|d| d.as_secs()),
+                    "Status tick"
+                );
+            } else {
+                tracing::info!(
+                    ?action,
+                    state = %status.state,
+                    previous = ?previous,
+                    has_draft = draft.is_some(),
+                    changed,
+                    spell_age_secs = working_for.map(|d| d.as_secs()),
+                    draft_delay_secs = delay.as_secs(),
+                    "Status decision"
+                );
+            }
+
+            match action {
                 Action::Nothing => {}
 
                 Action::StartDraft => {
                     let Some(room_id) = target_room(&known_rooms, &last_active_room) else {
                         // No room has talked to us yet; nothing to update.
+                        tracing::info!("Status draft skipped: no target room yet");
                         previous = Some(status.state);
                         continue;
                     };
                     if let Some(event_id) = send_status(&client, &room_id, &body).await {
+                        tracing::info!(
+                            room_id = %room_id,
+                            event_id = %event_id,
+                            spell_age_secs = working_for.map(|d| d.as_secs()),
+                            "Status draft posted"
+                        );
                         draft = Some(Draft {
                             room_id,
                             event_id,
@@ -337,6 +431,12 @@ pub fn spawn(
                     if let Some(d) = draft.as_mut()
                         && edit_status(&client, &d.room_id, &d.event_id, &body).await
                     {
+                        tracing::info!(
+                            room_id = %d.room_id,
+                            event_id = %d.event_id,
+                            spell_age_secs = working_for.map(|d| d.as_secs()),
+                            "Status draft edited"
+                        );
                         d.rendered = body;
                     }
                 }
@@ -346,6 +446,13 @@ pub fn spawn(
                         // Fold the final state into the draft, so a normal turn leaves one
                         // status message rather than a running commentary.
                         edit_status(&client, &d.room_id, &d.event_id, &body).await;
+                        tracing::info!(
+                            room_id = %d.room_id,
+                            event_id = %d.event_id,
+                            state = %status.state,
+                            alerting = status.state.needs_alert(),
+                            "Status draft closed"
+                        );
 
                         // That edit is silent. For states where nothing else will ever
                         // arrive, follow it with a short new message that actually pings.
@@ -357,6 +464,11 @@ pub fn spawn(
 
                 Action::AlertOnly => {
                     if let Some(room_id) = target_room(&known_rooms, &last_active_room) {
+                        tracing::info!(
+                            room_id = %room_id,
+                            state = %status.state,
+                            "Status alert sent with no draft"
+                        );
                         send_status(&client, &room_id, &render_alert(&status)).await;
                     }
                 }
