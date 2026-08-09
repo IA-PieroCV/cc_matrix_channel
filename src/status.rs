@@ -29,7 +29,11 @@ const TAIL_BYTES: u64 = 64 * 1024;
 /// one record per content block, so a text block is followed by a `tool_use` block a
 /// couple of seconds later when the turn continues. Treat a *recent* text block as still
 /// working, and only call it `WaitingForUser` once it has gone quiet for this long.
-const TEXT_GRACE: Duration = Duration::from_secs(10);
+///
+/// Public because it is the exact amount by which a working spell can outrun the turn it
+/// describes, which anything timing a spell has to account for — see
+/// [`AgentStatus::grace_held`].
+pub const TEXT_GRACE: Duration = Duration::from_secs(10);
 
 /// Default stall threshold, overridable with `CC_MATRIX_STALL_SECS`.
 pub const DEFAULT_STALL_SECS: u64 = 300;
@@ -94,6 +98,13 @@ pub struct AgentStatus {
     /// [`TAIL_BYTES`] window — which happens on genuinely long turns, exactly the ones
     /// worth watching. Treated as a nice-to-have: the state itself never depends on it.
     pub turn_elapsed: Option<Duration>,
+    /// True when `state` is `Working` *only* because the last record was assistant text
+    /// still inside [`TEXT_GRACE`].
+    ///
+    /// The distinction matters to anything that acts on how long the agent has been
+    /// working: this is the one flavour of `Working` that may already be over. Callers
+    /// that would spend a message on it should wait for the grace to resolve.
+    pub grace_held: bool,
 }
 
 impl AgentStatus {
@@ -103,6 +114,7 @@ impl AgentStatus {
             last_activity_age: None,
             last_tool: None,
             turn_elapsed: None,
+            grace_held: false,
         }
     }
 
@@ -397,13 +409,16 @@ pub fn read_status_at(path: &Path, stall_threshold: Duration, now: SystemTime) -
 
     let age = last_ts.and_then(|t| now.duration_since(t).ok());
 
-    let base = match last_record {
-        Record::ToolUse(_) | Record::ToolResult => AgentState::Working,
+    // `grace_held` rides along with the state so callers can tell the two kinds of
+    // `Working` apart: work demonstrably in flight, versus a reply that may already be
+    // the last word.
+    let (base, grace_held) = match last_record {
+        Record::ToolUse(_) | Record::ToolResult => (AgentState::Working, false),
         Record::AssistantText => match age {
-            Some(a) if a < TEXT_GRACE => AgentState::Working,
-            _ => AgentState::WaitingForUser,
+            Some(a) if a < TEXT_GRACE => (AgentState::Working, true),
+            _ => (AgentState::WaitingForUser, false),
         },
-        Record::UserPrompt => AgentState::Working,
+        Record::UserPrompt => (AgentState::Working, false),
     };
 
     // Stalling only applies to states that claim work is in progress. An agent that
@@ -422,6 +437,7 @@ pub fn read_status_at(path: &Path, stall_threshold: Duration, now: SystemTime) -
 
     AgentStatus {
         state,
+        grace_held,
         last_activity_age: age,
         last_tool: if matches!(state, AgentState::Working | AgentState::Stalled) {
             last_tool
@@ -634,6 +650,26 @@ mod tests {
         let s = read_status_at(&path, STALL, at("2026-08-08T12:00:06.000Z"));
         assert_eq!(s.state, AgentState::Working);
         assert_eq!(s.last_tool.as_deref(), Some("Bash"));
+    }
+
+    /// The turn may well be over here — a final reply five seconds ago looks exactly like
+    /// a text block about to be followed by a tool call. `Working` is the safe guess, but
+    /// callers that would spend a message on it need to know the guess is provisional.
+    #[test]
+    fn text_grace_working_is_flagged_as_provisional() {
+        let s = status_of(&[PROMPT, TEXT], "2026-08-08T12:00:14.000Z");
+
+        assert_eq!(s.state, AgentState::Working);
+        assert!(s.grace_held);
+    }
+
+    /// A tool call in flight is unambiguous: work really is happening right now.
+    #[test]
+    fn tool_use_working_is_not_provisional() {
+        let s = status_of(&[PROMPT, TOOL_USE], "2026-08-08T12:00:06.000Z");
+
+        assert_eq!(s.state, AgentState::Working);
+        assert!(!s.grace_held);
     }
 
     /// A session that has not been messaged since it started has no transcript yet, and

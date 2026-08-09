@@ -25,7 +25,7 @@ use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
 use matrix_sdk::ruma::{OwnedEventId, OwnedRoomId};
 use tokio_util::sync::CancellationToken;
 
-use crate::status::{AgentState, AgentStatus, read_status, stall_threshold};
+use crate::status::{AgentState, AgentStatus, TEXT_GRACE, read_status, stall_threshold};
 
 /// Poll cadence. Also the floor on edit frequency: every edit is a `room.send`, and
 /// homeservers rate-limit sends, so this must stay comfortably above one-per-second.
@@ -83,13 +83,15 @@ enum Action {
 /// `previous` is the state observed last tick; `has_draft` is whether a draft message is
 /// currently open; `changed` is whether the rendered body differs from what was last sent;
 /// `working_for` is how long the agent has been continuously working, or `None` if it is
-/// not working.
+/// not working; `grace_held` is [`AgentStatus::grace_held`] — whether the current
+/// `Working` rests only on a reply that is still inside the text grace window.
 fn decide(
     previous: Option<AgentState>,
     current: AgentState,
     has_draft: bool,
     changed: bool,
     working_for: Option<Duration>,
+    grace_held: bool,
     draft_delay: Duration,
 ) -> Action {
     match current {
@@ -105,11 +107,25 @@ fn decide(
                 } else {
                     Action::Nothing
                 }
-            } else if working_for.is_some_and(|d| d >= draft_delay) {
-                Action::StartDraft
             } else {
-                // Still inside the delay — a quick turn should leave no status behind.
-                Action::Nothing
+                // The spell clock counts the text grace window too, so a spell can cross
+                // the delay while the only evidence of work is a reply already sent — a
+                // turn of half the delay reaches it from the far side of its own reply.
+                // Discount that window rather than trusting the raw spell, so the delay
+                // means "the turn itself has run this long" either way. A spell can only
+                // outrun its turn by the grace, so once it is a whole grace past the
+                // delay the turn really has run the full delay, whatever the last record
+                // happens to be.
+                let required = if grace_held {
+                    draft_delay + TEXT_GRACE
+                } else {
+                    draft_delay
+                };
+                if working_for.is_some_and(|d| d >= required) {
+                    Action::StartDraft
+                } else {
+                    Action::Nothing
+                }
             }
         }
 
@@ -374,6 +390,7 @@ pub fn spawn(
                 draft.is_some(),
                 changed,
                 working_for,
+                status.grace_held,
                 delay,
             );
 
@@ -490,6 +507,9 @@ mod tests {
     const LONG: Duration = Duration::from_secs(60);
     /// Comfortably inside `DELAY` — "this turn just started".
     const SHORT: Duration = Duration::from_secs(2);
+    /// Past `DELAY`, but by less than the grace window. A spell can reach here purely by
+    /// the grace tacked onto a turn that finished well short of the delay.
+    const JUST_PAST_DELAY: Duration = Duration::from_secs(21);
 
     fn status(state: AgentState) -> AgentStatus {
         AgentStatus {
@@ -497,13 +517,22 @@ mod tests {
             last_activity_age: Some(Duration::from_secs(4)),
             last_tool: Some("Bash".to_string()),
             turn_elapsed: Some(Duration::from_secs(200)),
+            grace_held: false,
         }
     }
 
     #[test]
     fn first_working_tick_opens_a_draft() {
         assert_eq!(
-            decide(None, AgentState::Working, false, true, Some(LONG), DELAY),
+            decide(
+                None,
+                AgentState::Working,
+                false,
+                true,
+                Some(LONG),
+                false,
+                DELAY
+            ),
             Action::StartDraft
         );
     }
@@ -517,6 +546,7 @@ mod tests {
                 true,
                 true,
                 Some(LONG),
+                false,
                 DELAY
             ),
             Action::EditDraft
@@ -533,6 +563,7 @@ mod tests {
                 true,
                 false,
                 Some(LONG),
+                false,
                 DELAY
             ),
             Action::Nothing
@@ -545,7 +576,15 @@ mod tests {
     fn a_quick_turn_posts_nothing_at_all() {
         // Working, but not for long enough to be worth mentioning.
         assert_eq!(
-            decide(None, AgentState::Working, false, true, Some(SHORT), DELAY),
+            decide(
+                None,
+                AgentState::Working,
+                false,
+                true,
+                Some(SHORT),
+                false,
+                DELAY
+            ),
             Action::Nothing
         );
         // ...and then it finishes. Still nothing: no draft was ever opened.
@@ -556,16 +595,65 @@ mod tests {
                 false,
                 true,
                 None,
+                false,
                 DELAY
             ),
             Action::Nothing
         );
     }
 
+    /// The spell clock keeps running through the text grace window, so a turn barely over
+    /// half the delay still reaches the delay — from the far side of its own reply.
+    /// Opening a draft there posts a status for a turn that is already finished, which is
+    /// precisely the clutter the delay exists to prevent.
+    #[test]
+    fn no_draft_opens_on_a_turn_that_may_already_be_over() {
+        assert_eq!(
+            decide(
+                Some(AgentState::Working),
+                AgentState::Working,
+                false,
+                true,
+                Some(JUST_PAST_DELAY),
+                true,
+                DELAY
+            ),
+            Action::Nothing
+        );
+    }
+
+    /// ...but waiting does tell the two apart. A spell can only outrun the turn by the
+    /// grace window, so once it is a whole grace window past the delay the turn itself has
+    /// genuinely run the full delay, whatever the last record happens to be. A turn that
+    /// never calls a tool still deserves its draft.
+    #[test]
+    fn a_long_turn_drafts_even_if_its_last_record_is_text() {
+        assert_eq!(
+            decide(
+                Some(AgentState::Working),
+                AgentState::Working,
+                false,
+                true,
+                Some(LONG),
+                true,
+                DELAY
+            ),
+            Action::StartDraft
+        );
+    }
+
     #[test]
     fn draft_opens_once_the_turn_runs_long() {
         assert_eq!(
-            decide(None, AgentState::Working, false, true, Some(LONG), DELAY),
+            decide(
+                None,
+                AgentState::Working,
+                false,
+                true,
+                Some(LONG),
+                false,
+                DELAY
+            ),
             Action::StartDraft
         );
     }
@@ -577,7 +665,15 @@ mod tests {
     fn short_turn_that_fails_still_alerts() {
         for bad in [AgentState::Stalled, AgentState::Dead] {
             assert_eq!(
-                decide(Some(AgentState::Working), bad, false, true, None, DELAY),
+                decide(
+                    Some(AgentState::Working),
+                    bad,
+                    false,
+                    true,
+                    None,
+                    false,
+                    DELAY
+                ),
                 Action::AlertOnly,
                 "{bad:?} must be reported even with no draft open"
             );
@@ -593,7 +689,15 @@ mod tests {
             AgentState::Dead,
         ] {
             assert_eq!(
-                decide(Some(AgentState::Working), terminal, true, true, None, DELAY),
+                decide(
+                    Some(AgentState::Working),
+                    terminal,
+                    true,
+                    true,
+                    None,
+                    false,
+                    DELAY
+                ),
                 Action::CloseDraft,
                 "{terminal:?} should close the draft in place"
             );
@@ -643,6 +747,7 @@ mod tests {
                 true,
                 true,
                 None,
+                false,
                 DELAY
             ),
             Action::CloseDraft
@@ -655,6 +760,7 @@ mod tests {
                 false,
                 true,
                 None,
+                false,
                 DELAY
             ),
             Action::Nothing
@@ -679,7 +785,7 @@ mod tests {
             AgentState::Stalled,
         ];
         for state in sequence {
-            match decide(previous, state, has_draft, true, Some(LONG), DELAY) {
+            match decide(previous, state, has_draft, true, Some(LONG), false, DELAY) {
                 Action::StartDraft => {
                     has_draft = true;
                     starts += 1;
@@ -702,7 +808,15 @@ mod tests {
     #[test]
     fn no_announcement_without_a_preceding_working_spell() {
         assert_eq!(
-            decide(None, AgentState::WaitingForUser, false, true, None, DELAY),
+            decide(
+                None,
+                AgentState::WaitingForUser,
+                false,
+                true,
+                None,
+                false,
+                DELAY
+            ),
             Action::Nothing
         );
     }
@@ -716,6 +830,7 @@ mod tests {
                 true,
                 true,
                 Some(LONG),
+                false,
                 DELAY
             ),
             Action::Nothing
