@@ -1,12 +1,13 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use matrix_sdk::{
     Client, LoopCtrl, Room,
-    config::SyncSettings,
+    config::{RequestConfig, SyncSettings},
     ruma::{
         OwnedDeviceId, OwnedRoomId, OwnedUserId,
         events::{
@@ -25,6 +26,40 @@ use tokio_util::sync::CancellationToken;
 
 use crate::access::{AccessControl, AccessDenied};
 use crate::config::Config;
+
+/// Upper bound on how long the SDK may keep retrying a single failed request.
+///
+/// `RequestConfig::default()` leaves `retry_timeout` unset, which becomes
+/// `ExponentialBackoff { max_elapsed_time: None }` — i.e. retry forever. A
+/// transient 5xx on any request then never returns, and if that request was
+/// awaited from an event handler it stalls the whole sync loop silently.
+const REQUEST_RETRY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Outbound side effects (typing notices, reactions) are detached from the sync
+/// loop, but still shouldn't pile up forever if the homeserver is unhealthy.
+const SIDE_EFFECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long to wait for the MCP side to accept a notification before giving up
+/// and logging. Bounded so a stalled consumer cannot wedge sync.
+const NOTIFY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the sync loop may go without completing a single sync before the
+/// watchdog declares it stalled and restarts it. The SDK's default sync timeout
+/// is 30s, so a healthy loop checks in far more often than this.
+const SYNC_STALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How often the watchdog compares the sync heartbeat against the wall clock.
+const WATCHDOG_TICK: Duration = Duration::from_secs(15);
+
+/// Delay before re-entering the sync loop after it stalled or returned an error.
+const SYNC_RESTART_DELAY: Duration = Duration::from_secs(5);
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// Persisted session for restore across restarts.
 #[derive(Serialize, Deserialize)]
@@ -107,6 +142,16 @@ struct MessageHandlerCtx {
     start_time: Instant,
 }
 
+/// Why the supervised sync task stopped running.
+enum SyncOutcome {
+    /// Shutdown was requested.
+    Cancelled,
+    /// The sync loop returned on its own (cleanly, with an error, or by panic).
+    Returned(std::result::Result<matrix_sdk::Result<()>, tokio::task::JoinError>),
+    /// The watchdog saw no completed sync for this many seconds.
+    Stalled(u64),
+}
+
 pub struct MatrixBridge {
     client: Client,
     own_user_id: OwnedUserId,
@@ -136,9 +181,14 @@ impl MatrixBridge {
             .as_ref()
             .context("MATRIX_HOMESERVER_URL is required")?;
 
-        // Build client with E2EE settings
+        // Build client with E2EE settings.
+        //
+        // `retry_timeout` is set explicitly: without it the SDK retries transient
+        // (5xx / 429) failures with unbounded exponential backoff and the request
+        // future never resolves. See REQUEST_RETRY_TIMEOUT.
         let client = Client::builder()
             .homeserver_url(homeserver_url)
+            .request_config(RequestConfig::default().retry_timeout(REQUEST_RETRY_TIMEOUT))
             .sqlite_store(&config.store_path, config.store_passphrase.as_deref())
             .with_encryption_settings(matrix_sdk::encryption::EncryptionSettings {
                 auto_enable_cross_signing: true,
@@ -325,21 +375,105 @@ impl MatrixBridge {
                 }
             });
 
-        tracing::info!("Starting Matrix sync loop");
-        let cancel = self.cancel.clone();
-        self.client
-            .sync_with_callback(SyncSettings::default(), move |_response| {
-                let cancel = cancel.clone();
-                async move {
-                    if cancel.is_cancelled() {
-                        LoopCtrl::Break
-                    } else {
-                        LoopCtrl::Continue
+        tracing::info!(
+            "Starting Matrix sync loop (stall watchdog: {}s)",
+            SYNC_STALL_TIMEOUT.as_secs()
+        );
+        self.supervise_sync().await
+    }
+
+    /// Runs the sync loop under a liveness watchdog, restarting it if it stalls
+    /// or fails.
+    ///
+    /// The sync loop runs in its own task specifically so a *wedged* sync can be
+    /// aborted. A wedged sync returns no error and exits no loop — the process
+    /// stays up and the MCP server keeps answering, so from the outside the
+    /// bridge looks healthy while never delivering another message. The only
+    /// reliable signal is the absence of completed syncs, which is what the
+    /// heartbeat below measures.
+    async fn supervise_sync(&self) -> Result<()> {
+        let heartbeat = Arc::new(AtomicU64::new(now_unix()));
+        let mut consecutive_failures: u32 = 0;
+
+        loop {
+            if self.cancel.is_cancelled() {
+                break;
+            }
+
+            heartbeat.store(now_unix(), Ordering::Relaxed);
+
+            let client = self.client.clone();
+            let cancel = self.cancel.clone();
+            let beat = heartbeat.clone();
+            let mut sync_task = tokio::spawn(async move {
+                client
+                    .sync_with_callback(SyncSettings::default(), move |_response| {
+                        let cancel = cancel.clone();
+                        let beat = beat.clone();
+                        async move {
+                            beat.store(now_unix(), Ordering::Relaxed);
+                            if cancel.is_cancelled() {
+                                LoopCtrl::Break
+                            } else {
+                                LoopCtrl::Continue
+                            }
+                        }
+                    })
+                    .await
+            });
+
+            let outcome = loop {
+                tokio::select! {
+                    joined = &mut sync_task => break SyncOutcome::Returned(joined),
+                    _ = self.cancel.cancelled() => {
+                        sync_task.abort();
+                        break SyncOutcome::Cancelled;
+                    }
+                    _ = tokio::time::sleep(WATCHDOG_TICK) => {
+                        let idle = now_unix().saturating_sub(heartbeat.load(Ordering::Relaxed));
+                        if idle >= SYNC_STALL_TIMEOUT.as_secs() {
+                            sync_task.abort();
+                            break SyncOutcome::Stalled(idle);
+                        }
                     }
                 }
-            })
-            .await?;
-        tracing::info!("Matrix sync loop stopped");
+            };
+
+            match outcome {
+                SyncOutcome::Cancelled => break,
+                SyncOutcome::Returned(Ok(Ok(()))) => {
+                    tracing::info!("Matrix sync loop stopped");
+                    break;
+                }
+                SyncOutcome::Stalled(idle) => {
+                    consecutive_failures += 1;
+                    tracing::error!(
+                        "Matrix sync stalled — no sync completed for {idle}s (failure #{consecutive_failures}); restarting sync loop"
+                    );
+                }
+                SyncOutcome::Returned(Ok(Err(e))) => {
+                    consecutive_failures += 1;
+                    tracing::error!(
+                        "Matrix sync loop failed (failure #{consecutive_failures}): {e:?}; restarting"
+                    );
+                }
+                SyncOutcome::Returned(Err(e)) => {
+                    consecutive_failures += 1;
+                    tracing::error!(
+                        "Matrix sync task terminated unexpectedly (failure #{consecutive_failures}): {e}; restarting"
+                    );
+                }
+            }
+
+            // Escalating backoff so a hard, permanent failure (bad token, for
+            // instance) doesn't turn into a hot restart loop.
+            let backoff = SYNC_RESTART_DELAY * consecutive_failures.min(12);
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = self.cancel.cancelled() => break,
+            }
+        }
+
         Ok(())
     }
 
@@ -347,10 +481,17 @@ impl MatrixBridge {
         let client = room.client();
         let own_id = client.user_id();
         if own_id.is_some_and(|id| *id == *event.state_key) {
-            tracing::info!("Received invite to room {}, joining", room.room_id());
-            if let Err(e) = room.join().await {
-                tracing::error!("Failed to join room {}: {e}", room.room_id());
-            }
+            let room_id = room.room_id().to_owned();
+            tracing::info!("Received invite to room {room_id}, joining");
+            // Detached: joining is a network round trip and must not run on the
+            // sync loop (see spawn_room_send).
+            tokio::spawn(async move {
+                match tokio::time::timeout(SIDE_EFFECT_TIMEOUT, room.join()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::error!("Failed to join room {room_id}: {e}"),
+                    Err(_) => tracing::error!("Timed out joining room {room_id}"),
+                }
+            });
         }
     }
 
@@ -478,13 +619,24 @@ impl MatrixBridge {
         if access.requires_mention(room.room_id()) {
             let own_id_str = own_user_id.as_str();
             if !text.contains(own_id_str) {
-                let own_name = room
-                    .client()
-                    .account()
-                    .get_display_name()
-                    .await
-                    .ok()
-                    .flatten();
+                // Bounded: this runs on the sync loop, so it must not be able to
+                // hang (see spawn_room_send).
+                let own_name = match tokio::time::timeout(
+                    SIDE_EFFECT_TIMEOUT,
+                    room.client().account().get_display_name(),
+                )
+                .await
+                {
+                    Ok(Ok(name)) => name,
+                    Ok(Err(e)) => {
+                        tracing::warn!("Failed to fetch own display name: {e}");
+                        None
+                    }
+                    Err(_) => {
+                        tracing::warn!("Timed out fetching own display name");
+                        None
+                    }
+                };
                 let mentioned = own_name
                     .as_ref()
                     .is_some_and(|name| text.contains(name.as_str()));
@@ -530,13 +682,34 @@ impl MatrixBridge {
                     );
                     let reaction =
                         matrix_sdk::ruma::events::reaction::ReactionEventContent::new(annotation);
-                    let _ = room.send(reaction).await;
+                    spawn_room_send("verdict reaction", room.clone(), reaction);
                     return;
                 }
 
                 // Typing indicator — only for text messages (media won't get a Claude response)
                 if attachments.is_empty() {
-                    let _ = room.typing_notice(true).await;
+                    let typing_room = room.clone();
+                    let typing_room_id = room.room_id().to_owned();
+                    tokio::spawn(async move {
+                        match tokio::time::timeout(
+                            SIDE_EFFECT_TIMEOUT,
+                            typing_room.typing_notice(true),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                tracing::warn!(
+                                    "Failed to send typing notice in {typing_room_id}: {e}"
+                                )
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    "Timed out sending typing notice in {typing_room_id}"
+                                )
+                            }
+                        }
+                    });
                 }
 
                 let display_name = room
@@ -562,7 +735,23 @@ impl MatrixBridge {
                     timestamp,
                     attachments,
                 };
-                if tx.send(notif).await.is_ok() {
+                // Bounded: a stalled MCP consumer must not be able to wedge sync.
+                let queued = match tokio::time::timeout(NOTIFY_TIMEOUT, tx.send(notif)).await {
+                    Ok(Ok(())) => true,
+                    Ok(Err(_)) => {
+                        tracing::error!("Failed to send notification to MCP");
+                        false
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            "Timed out after {}s queueing notification to MCP — consumer stalled",
+                            NOTIFY_TIMEOUT.as_secs()
+                        );
+                        false
+                    }
+                };
+
+                if queued {
                     // Ack reaction — confirms message was received
                     if let Some(emoji) = access.ack_reaction() {
                         let annotation = matrix_sdk::ruma::events::relation::Annotation::new(
@@ -573,10 +762,8 @@ impl MatrixBridge {
                             matrix_sdk::ruma::events::reaction::ReactionEventContent::new(
                                 annotation,
                             );
-                        let _ = room.send(reaction).await;
+                        spawn_room_send("ack reaction", room.clone(), reaction);
                     }
-                } else {
-                    tracing::error!("Failed to send notification to MCP");
                 }
             }
             Err(AccessDenied::PairingRequired(code)) => {
@@ -584,9 +771,7 @@ impl MatrixBridge {
                     "Pairing required. Ask the Claude Code operator to approve you with code: {code}"
                 );
                 let content = RoomMessageEventContent::text_plain(&msg);
-                if let Err(e) = room.send(content).await {
-                    tracing::error!("Failed to send pairing message: {e}");
-                }
+                spawn_room_send("pairing message", room.clone(), content);
                 access.mark_pairing_reply_sent(&sender_id);
             }
             Err(
@@ -631,9 +816,7 @@ impl MatrixBridge {
 
         if let Some(msg) = response {
             let content = RoomMessageEventContent::text_plain(&msg);
-            if let Err(e) = room.send(content).await {
-                tracing::error!("Failed to send bot command response: {e}");
-            }
+            spawn_room_send("bot command response", room.clone(), content);
         }
     }
 
@@ -647,6 +830,31 @@ impl MatrixBridge {
         room.send(content).await?;
         Ok(())
     }
+}
+
+// --- Outbound side effects ---
+
+/// Send a room event without blocking the sync loop.
+///
+/// matrix-sdk awaits event-handler futures inline while processing a sync
+/// response (`Client::call_event_handlers`), so anything awaited inside a
+/// handler delays every subsequent message — and if it never returns, sync stops
+/// forever with no error and no exit. Reactions, typing notices and courtesy
+/// replies are all fire-and-forget, so they belong on their own task with a
+/// hard timeout.
+fn spawn_room_send<C>(label: &'static str, room: Room, content: C)
+where
+    C: matrix_sdk::ruma::events::MessageLikeEventContent + Send + 'static,
+{
+    let room_id = room.room_id().to_owned();
+    tokio::spawn(async move {
+        let send = async { room.send(content).await };
+        match tokio::time::timeout(SIDE_EFFECT_TIMEOUT, send).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!("Failed to send {label} in {room_id}: {e}"),
+            Err(_) => tracing::warn!("Timed out sending {label} in {room_id}"),
+        }
+    });
 }
 
 // --- Session persistence ---
