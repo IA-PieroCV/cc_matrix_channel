@@ -17,6 +17,7 @@ use rmcp::{ServiceExt, transport::stdio};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::writer::MakeWriterExt;
 
 use crate::access::AccessControl;
 use crate::config::Config;
@@ -25,16 +26,56 @@ use crate::mcp::{MatrixChannelServer, McpServerConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // All logging goes to stderr — stdout is exclusively for MCP JSON-RPC
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_ansi(false)
-        .init();
+    // Logging goes to stderr — stdout is exclusively for MCP JSON-RPC. Stderr is
+    // captured and discarded by the host (Claude Code), so a copy also goes to a
+    // rolling file; without it a silent stall leaves no evidence anywhere.
+    let log_dir = dirs_next::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".claude")
+        .join("channels")
+        .join("matrix");
+    let filter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    let file_logging = std::fs::create_dir_all(&log_dir).ok().and_then(|()| {
+        tracing_appender::rolling::Builder::new()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix("bridge")
+            .filename_suffix("log")
+            .max_log_files(7)
+            .build(&log_dir)
+            .ok()
+    });
+
+    // Guard must outlive main's body — dropping it stops the writer thread.
+    let _log_guard = match file_logging {
+        Some(appender) => {
+            let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr.and(non_blocking))
+                .with_env_filter(filter())
+                .with_ansi(false)
+                .init();
+            Some(guard)
+        }
+        None => {
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .with_env_filter(filter())
+                .with_ansi(false)
+                .init();
+            None
+        }
+    };
 
     tracing::info!("cc_matrix_channel v{} starting", env!("CARGO_PKG_VERSION"));
+    if _log_guard.is_some() {
+        tracing::info!("Logging to {}/bridge.<date>.log", log_dir.display());
+    } else {
+        tracing::warn!(
+            "File logging unavailable ({}) — stderr only",
+            log_dir.display()
+        );
+    }
 
     // Load .env file if present (process env vars from .mcp.json take precedence)
     let env_path = dirs_next::home_dir()
